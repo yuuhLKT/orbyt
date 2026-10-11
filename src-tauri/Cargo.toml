@@ -1,0 +1,35 @@
+[package]
+name = "orbyt"
+version = "0.1.0"
+description = "Local-first desktop control center for AI-assisted development"
+authors = ["Orbyt contributors"]
+edition = "2021"
+
+[lib]
+name = "orbyt_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+keyring = { version = "4.2", features = ["v1"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
+rusqlite = { version = "0.38", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "process", "time", "sync", "macros"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
