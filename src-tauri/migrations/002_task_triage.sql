@@ -1,0 +1,8 @@
+ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE triage_reports (
+  task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_revision INTEGER NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
