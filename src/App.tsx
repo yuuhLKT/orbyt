@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
   AlertCircle,
+  ArrowLeft,
   ArrowDownLeft,
   ArrowRight,
   Bot,
@@ -90,6 +91,60 @@ function useTasks() {
 }
 function useAppSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: api.settings });
+}
+
+const FIRST_RUN_PROGRESS_KEY = 'orbyt.first-run.progress.v1';
+const FIRST_RUN_DISMISSED_KEY = 'orbyt.first-run.dismissed';
+
+type FirstRunProgress = { step: number; projectId?: string };
+
+function readFirstRunProgress(): FirstRunProgress | null {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(FIRST_RUN_PROGRESS_KEY) ?? 'null');
+    if (typeof value !== 'object' || value === null) return null;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.step === 'number' &&
+      Number.isInteger(record.step) &&
+      record.step >= 0 &&
+      record.step <= 3 &&
+      (record.projectId === undefined || typeof record.projectId === 'string')
+    ) {
+      return {
+        step: record.step,
+        projectId: typeof record.projectId === 'string' ? record.projectId : undefined,
+      };
+    }
+  } catch {
+    // Storage is optional; onboarding can still run in memory.
+  }
+  return null;
+}
+
+function writeFirstRunProgress(progress: FirstRunProgress | null) {
+  try {
+    if (progress) localStorage.setItem(FIRST_RUN_PROGRESS_KEY, JSON.stringify(progress));
+    else localStorage.removeItem(FIRST_RUN_PROGRESS_KEY);
+  } catch {
+    // Storage is optional; onboarding can still run in memory.
+  }
+}
+
+function readFirstRunDismissed() {
+  try {
+    return sessionStorage.getItem(FIRST_RUN_DISMISSED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function writeFirstRunDismissed(dismissed: boolean) {
+  try {
+    if (dismissed) sessionStorage.setItem(FIRST_RUN_DISMISSED_KEY, 'true');
+    else sessionStorage.removeItem(FIRST_RUN_DISMISSED_KEY);
+  } catch {
+    // Storage is optional; onboarding can still run in memory.
+  }
 }
 
 function App() {
@@ -298,9 +353,44 @@ function PageHeading({
 }
 
 function Overview() {
-  const { data: projects = [], isLoading: loadingProjects, error: projectsError } = useProjects();
+  const projectsQuery = useProjects();
+  const { data: projects = [], isLoading: loadingProjects, error: projectsError } = projectsQuery;
   const { data: tasks = [], isLoading: loadingTasks, error: tasksError } = useTasks();
+  const [onboardingProgress, setOnboardingProgress] = useState(readFirstRunProgress);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(readFirstRunDismissed);
   const isLoading = loadingProjects || loadingTasks;
+  const effectiveProgress = onboardingProgress
+    ? onboardingProgress.projectId &&
+      projects.some((project) => project.id === onboardingProgress.projectId)
+      ? onboardingProgress
+      : onboardingProgress.step === 0 && !onboardingProgress.projectId
+        ? onboardingProgress
+        : { step: 0 }
+    : null;
+  const displayProgress =
+    effectiveProgress ?? (projectsQuery.isSuccess && projects.length === 0 ? { step: 0 } : null);
+  const showOnboarding =
+    projectsQuery.isSuccess &&
+    !projectsError &&
+    !onboardingDismissed &&
+    (Boolean(displayProgress) || projects.length === 0);
+  const updateOnboarding = (progress: FirstRunProgress | null) => {
+    writeFirstRunProgress(progress);
+    setOnboardingProgress(progress);
+  };
+  const dismissOnboarding = () => {
+    writeFirstRunDismissed(true);
+    setOnboardingDismissed(true);
+  };
+  const startOnboarding = () => {
+    writeFirstRunDismissed(false);
+    setOnboardingDismissed(false);
+    if (!effectiveProgress) updateOnboarding({ step: 0 });
+  };
+  const finishOnboarding = () => {
+    updateOnboarding(null);
+    dismissOnboarding();
+  };
   const counts = useMemo(
     () => ({
       pending: tasks.filter((task) =>
@@ -313,6 +403,17 @@ function Overview() {
     }),
     [tasks],
   );
+  if (showOnboarding && displayProgress) {
+    return (
+      <FirstRunOnboarding
+        projects={projects}
+        progress={displayProgress}
+        onProgress={updateOnboarding}
+        onDismiss={dismissOnboarding}
+        onFinish={finishOnboarding}
+      />
+    );
+  }
   return (
     <>
       <PageHeading
@@ -320,10 +421,22 @@ function Overview() {
         title="Your workspace"
         description="Here's what's happening across your development workspace."
         action={
-          <Link className="button button-primary" to="/tasks">
-            <Plus size={16} />
-            New task
-          </Link>
+          onboardingProgress ? (
+            <button className="button button-primary" onClick={startOnboarding}>
+              <RefreshCw size={15} />
+              Finish setup
+            </button>
+          ) : projects.length === 0 ? (
+            <button className="button button-primary" onClick={startOnboarding}>
+              <Sparkles size={15} />
+              Start setup
+            </button>
+          ) : (
+            <Link className="button button-primary" to="/tasks">
+              <Plus size={16} />
+              New task
+            </Link>
+          )
         }
       />
       {(projectsError || tasksError) && (
@@ -447,6 +560,356 @@ function Overview() {
         </div>
       )}
     </>
+  );
+}
+
+const FIRST_RUN_STEPS = ['Project', 'Execution scope', 'OpenCode', 'Sources'];
+
+function FirstRunOnboarding({
+  projects,
+  progress,
+  onProgress,
+  onDismiss,
+  onFinish,
+}: {
+  projects: Project[];
+  progress: FirstRunProgress;
+  onProgress: (progress: FirstRunProgress | null) => void;
+  onDismiss: () => void;
+  onFinish: () => void;
+}) {
+  const project = projects.find((item) => item.id === progress.projectId);
+  const [projectToUseId, setProjectToUseId] = useState(progress.projectId ?? projects[0]?.id ?? '');
+  const [showProjectForm, setShowProjectForm] = useState(false);
+  const [showScopeForm, setShowScopeForm] = useState(false);
+  const [scopeMessage, setScopeMessage] = useState('');
+  const [executable, setExecutable] = useState<string | null>(null);
+  const [endpoint, setEndpoint] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verification, setVerification] = useState<{
+    connected: boolean;
+    message: string;
+    version?: string | null;
+  } | null>(null);
+  const [verifyError, setVerifyError] = useState('');
+  const { data: settings = {}, isLoading: settingsLoading } = useAppSettings();
+  const queryClient = useQueryClient();
+  const scopesQuery = useQuery({
+    queryKey: ['scopes', project?.id],
+    queryFn: () => api.scopes(project!.id),
+    enabled: Boolean(project),
+  });
+  const scopes = scopesQuery.data ?? [];
+  const writableScopes = scopes.filter((scope) => scope.writeAccess);
+  const step = Math.max(0, Math.min(progress.step, FIRST_RUN_STEPS.length - 1));
+
+  const goTo = (nextStep: number) =>
+    onProgress({
+      step: Math.max(0, Math.min(nextStep, FIRST_RUN_STEPS.length - 1)),
+      projectId: project?.id ?? progress.projectId,
+    });
+
+  async function verifyOpenCode(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setVerifyError('');
+    setVerification(null);
+    setIsVerifying(true);
+    const nextExecutable = executable ?? settings['opencode_executable'] ?? 'opencode';
+    const nextEndpoint = endpoint ?? settings['opencode_endpoint'] ?? '';
+    try {
+      await Promise.all([
+        api.saveSetting('opencode_executable', nextExecutable),
+        api.saveSetting('opencode_endpoint', nextEndpoint),
+      ]);
+      const result = await api.verifyOpenCode();
+      setVerification(result);
+      await api.saveSetting('opencode_last_connected', String(result.connected));
+      await queryClient.invalidateQueries({ queryKey: keys.settings });
+    } catch (cause) {
+      const message = errorMessage(cause);
+      setVerifyError(message);
+      await api.saveSetting('opencode_last_connected', 'false').catch(() => undefined);
+      await queryClient.invalidateQueries({ queryKey: keys.settings });
+    } finally {
+      setIsVerifying(false);
+    }
+  }
+
+  return (
+    <div className="first-run-page">
+      <PageHeading
+        eyebrow="FIRST RUN"
+        title="Set up Orbyt"
+        description="Connect a local project, then configure the tools you want Orbyt to use. You can skip optional steps and finish them later in Settings."
+        action={
+          <button className="button button-secondary" onClick={onDismiss}>
+            Do this later
+          </button>
+        }
+      />
+      <section className="first-run-card" aria-labelledby="first-run-step-title">
+        <nav className="first-run-steps" aria-label="Setup progress">
+          {FIRST_RUN_STEPS.map((label, index) => (
+            <button
+              className={`first-run-step${index === step ? ' active' : ''}${index < step ? ' complete' : ''}`}
+              type="button"
+              key={label}
+              aria-current={index === step ? 'step' : undefined}
+              disabled={index > step}
+              onClick={() => goTo(index)}
+            >
+              <span className="first-run-step-number">
+                {index < step ? <Check size={13} /> : index + 1}
+              </span>
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="first-run-content">
+          {step === 0 && (
+            <>
+              <div className="first-run-icon">
+                <FolderKanban size={20} />
+              </div>
+              <h2 id="first-run-step-title">Choose a project folder</h2>
+              <p>
+                Register the local repository Orbyt should work with. Orbyt stores its path and does
+                not move or copy your files.
+              </p>
+              {projects.length > 0 && (
+                <div className="first-run-existing-project">
+                  <label className="field-label">
+                    Use an existing project
+                    <select
+                      value={projectToUseId || progress.projectId || projects[0]?.id || ''}
+                      onChange={(event) => setProjectToUseId(event.target.value)}
+                    >
+                      {projects.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} · {item.directory}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className="button button-secondary"
+                    disabled={projects.length === 0}
+                    onClick={() =>
+                      onProgress({
+                        step: 1,
+                        projectId: projectToUseId || progress.projectId || projects[0].id,
+                      })
+                    }
+                  >
+                    Continue with project <ArrowRight size={14} />
+                  </button>
+                </div>
+              )}
+              <button className="button button-primary" onClick={() => setShowProjectForm(true)}>
+                <FolderOpen size={15} />
+                Register a project folder
+              </button>
+            </>
+          )}
+
+          {step === 1 && (
+            <>
+              <div className="first-run-icon">
+                <ShieldCheck size={20} />
+              </div>
+              <h2 id="first-run-step-title">Choose a writable execution scope</h2>
+              <p>
+                A scope identifies the part of this project where OpenCode may make changes. It is
+                required for automatic GitHub task execution.
+              </p>
+              {!project ? (
+                <LoadingState label="Loading your project" />
+              ) : scopesQuery.isLoading ? (
+                <LoadingState label="Checking execution scopes" />
+              ) : scopesQuery.error ? (
+                <ErrorBanner message={errorMessage(scopesQuery.error)} />
+              ) : writableScopes.length > 0 ? (
+                <div className="first-run-success" role="status">
+                  <Check size={16} />
+                  {writableScopes.length} writable{' '}
+                  {writableScopes.length === 1 ? 'scope is' : 'scopes are'} available for{' '}
+                  {project.name}.
+                </div>
+              ) : (
+                <div className="first-run-note">
+                  <TriangleAlert size={16} />
+                  <span>
+                    No writable scope yet. You can continue, but GitHub automatic execution will
+                    stay unavailable until one is added.
+                  </span>
+                </div>
+              )}
+              {scopeMessage && (
+                <p className="field-hint" role="status">
+                  {scopeMessage}
+                </p>
+              )}
+              <div className="first-run-actions">
+                <button
+                  className="button button-secondary"
+                  onClick={() => {
+                    setScopeMessage('');
+                    setShowScopeForm(true);
+                  }}
+                  disabled={!project}
+                >
+                  <Plus size={15} /> Add writable scope
+                </button>
+                <button
+                  className="button button-primary"
+                  onClick={() => goTo(2)}
+                  disabled={!project || scopesQuery.isLoading}
+                >
+                  {writableScopes.length > 0 ? 'Continue' : 'Continue without a scope'}{' '}
+                  <ArrowRight size={14} />
+                </button>
+              </div>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <div className="first-run-icon">
+                <Command size={20} />
+              </div>
+              <h2 id="first-run-step-title">Connect OpenCode</h2>
+              <p>
+                Orbyt uses your installed OpenCode CLI and its existing provider login. Verify the
+                connection now or configure it later in Settings.
+              </p>
+              {settingsLoading ? (
+                <LoadingState label="Loading OpenCode settings" />
+              ) : (
+                <form
+                  className="first-run-opencode"
+                  onSubmit={(event) => void verifyOpenCode(event)}
+                >
+                  <label className="field-label">
+                    OpenCode executable
+                    <input
+                      value={executable ?? settings['opencode_executable'] ?? 'opencode'}
+                      onChange={(event) => setExecutable(event.target.value)}
+                      placeholder="opencode"
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className="field-label">
+                    Optional local API endpoint
+                    <input
+                      value={endpoint ?? settings['opencode_endpoint'] ?? ''}
+                      onChange={(event) => setEndpoint(event.target.value)}
+                      placeholder="http://127.0.0.1:4096"
+                      autoComplete="url"
+                    />
+                  </label>
+                  <div className="first-run-actions">
+                    <button
+                      className="button button-secondary"
+                      type="submit"
+                      disabled={isVerifying}
+                    >
+                      {isVerifying ? (
+                        <LoaderCircle className="spin" size={14} />
+                      ) : (
+                        <RefreshCw size={14} />
+                      )}{' '}
+                      Verify connection
+                    </button>
+                    <button className="button button-primary" type="button" onClick={() => goTo(3)}>
+                      Continue <ArrowRight size={14} />
+                    </button>
+                  </div>
+                </form>
+              )}
+              {verification && (
+                <div
+                  className={verification.connected ? 'first-run-success' : 'first-run-note'}
+                  role="status"
+                >
+                  {verification.connected ? <Check size={16} /> : <TriangleAlert size={16} />}
+                  <span>
+                    {verification.connected
+                      ? `Connected${verification.version ? ` · ${verification.version}` : ''}.`
+                      : 'OpenCode could not be verified.'}{' '}
+                    {verification.message}
+                  </span>
+                </div>
+              )}
+              {verifyError && <ErrorBanner message={verifyError} />}
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <div className="first-run-icon">
+                <GitBranch size={20} />
+              </div>
+              <h2 id="first-run-step-title">Connect GitHub and GLPI</h2>
+              <p>
+                Sign in with your GitHub App, select the Project and its pending Status, then add
+                your GLPI 10 API URL and tokens to load linked ticket context. Both sources are
+                optional.
+              </p>
+              {project ? (
+                <SourceIntegrations lockedProjectId={project.id} />
+              ) : (
+                <ErrorBanner message="The project selected for setup is no longer available. Go back and choose a project." />
+              )}
+              <div className="first-run-finish">
+                <button className="button button-secondary" onClick={onFinish}>
+                  Configure sources later
+                </button>
+                <button className="button button-primary" onClick={onFinish}>
+                  <Check size={15} /> Finish setup
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {step > 0 && (
+          <div className="first-run-footer">
+            <button className="button button-secondary" onClick={() => goTo(step - 1)}>
+              <ArrowLeft size={14} /> Back
+            </button>
+            {project && (
+              <span>
+                Project: <strong>{project.name}</strong>
+              </span>
+            )}
+          </div>
+        )}
+      </section>
+      {showProjectForm && (
+        <ProjectForm
+          onClose={() => setShowProjectForm(false)}
+          onCreated={(createdProject) => {
+            setProjectToUseId(createdProject.id);
+            onProgress({ step: 1, projectId: createdProject.id });
+          }}
+        />
+      )}
+      {showScopeForm && project && (
+        <ScopeForm
+          project={project}
+          onClose={() => setShowScopeForm(false)}
+          onCreated={(scope) => {
+            setScopeMessage(
+              scope.writeAccess
+                ? `Writable scope “${scope.name}” added.`
+                : 'This scope is read-only. Add a writable scope to enable automatic GitHub execution.',
+            );
+            if (scope.writeAccess) goTo(2);
+          }}
+        />
+      )}
+    </div>
   );
 }
 
@@ -640,7 +1103,15 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
   );
 }
 
-function ProjectForm({ onClose, project }: { onClose: () => void; project?: Project }) {
+function ProjectForm({
+  onClose,
+  project,
+  onCreated,
+}: {
+  onClose: () => void;
+  project?: Project;
+  onCreated?: (project: Project) => void;
+}) {
   const queryClient = useQueryClient();
   const { data: settings = {} } = useAppSettings();
   const [directory, setDirectory] = useState(project?.directory ?? '');
@@ -658,8 +1129,9 @@ function ProjectForm({ onClose, project }: { onClose: () => void; project?: Proj
       directory: string;
       maxConcurrentSessions: number;
     }) => (project ? api.updateProject(project.id, input) : api.createProject(input)),
-    onSuccess: () => {
+    onSuccess: (savedProject) => {
       void queryClient.invalidateQueries({ queryKey: keys.projects });
+      if (!project) onCreated?.(savedProject);
       onClose();
     },
     onError: (error) => setMessage(errorMessage(error)),
@@ -955,13 +1427,22 @@ function ScopeRow({ scope, onDelete }: { scope: ExecutionScope; onDelete: () => 
   );
 }
 
-function ScopeForm({ project, onClose }: { project: Project; onClose: () => void }) {
+function ScopeForm({
+  project,
+  onClose,
+  onCreated,
+}: {
+  project: Project;
+  onClose: () => void;
+  onCreated?: (scope: ExecutionScope) => void;
+}) {
   const queryClient = useQueryClient();
   const [message, setMessage] = useState('');
   const create = useMutation({
     mutationFn: api.createScope,
-    onSuccess: () => {
+    onSuccess: (scope) => {
       void queryClient.invalidateQueries({ queryKey: ['scopes', project.id] });
+      onCreated?.(scope);
       onClose();
     },
     onError: (error) => setMessage(errorMessage(error)),
@@ -2598,7 +3079,7 @@ function Settings() {
   );
 }
 
-function SourceIntegrations() {
+function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = {}) {
   const queryClient = useQueryClient();
   const { data: projects = [] } = useProjects();
   const [selectedProjectId, setSelectedProjectId] = useState('');
@@ -2606,7 +3087,7 @@ function SourceIntegrations() {
   const [glpiUserToken, setGlpiUserToken] = useState('');
   const [glpiAppToken, setGlpiAppToken] = useState('');
   const [message, setMessage] = useState('');
-  const projectId = selectedProjectId || projects[0]?.id || '';
+  const projectId = lockedProjectId || selectedProjectId || projects[0]?.id || '';
   const {
     data: connections = [],
     isLoading,
@@ -2663,19 +3144,27 @@ function SourceIntegrations() {
         />
       ) : (
         <>
-          <label className="field-label">
-            Import into project
-            <select
-              value={projectId}
-              onChange={(event) => setSelectedProjectId(event.target.value)}
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {lockedProjectId ? (
+            <p className="field-hint">
+              Sources will be connected to{' '}
+              {projects.find((project) => project.id === projectId)?.name ?? 'the selected project'}
+              .
+            </p>
+          ) : (
+            <label className="field-label">
+              Import into project
+              <select
+                value={projectId}
+                onChange={(event) => setSelectedProjectId(event.target.value)}
+              >
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="settings-subsection">
             <GitHubProjectIntegration key={projectId} projectId={projectId} onChanged={refresh} />
           </div>
@@ -2852,6 +3341,8 @@ function GitHubProjectIntegration({
 }) {
   const queryClient = useQueryClient();
   const { data: settings = {} } = useAppSettings();
+  const { data: localProjects = [] } = useProjects();
+  const localProject = localProjects.find((project) => project.id === projectId);
   const { data: scopes = [] } = useQuery({
     queryKey: ['scopes', projectId],
     queryFn: () => api.scopes(projectId),
@@ -2864,6 +3355,7 @@ function GitHubProjectIntegration({
   const [pendingOptionId, setPendingOptionId] = useState('');
   const [executionScopeId, setExecutionScopeId] = useState('');
   const [editingConfig, setEditingConfig] = useState(false);
+  const [showScopeForm, setShowScopeForm] = useState(false);
   const [devicePrompt, setDevicePrompt] = useState<DeviceFlowPrompt | null>(null);
   const [message, setMessage] = useState('');
   const clientId = settings.github_app_client_id?.trim() ?? '';
@@ -3257,10 +3749,20 @@ function GitHubProjectIntegration({
             </select>
             {scopes.filter((scope) => scope.writeAccess).length === 0 && (
               <span className="field-hint">
-                Create a writable scope in this project's settings before connecting GitHub.
+                Create a writable scope before connecting GitHub. Orbyt requires one for automatic
+                execution.
               </span>
             )}
           </label>
+          {scopes.filter((scope) => scope.writeAccess).length === 0 && localProject && (
+            <button
+              className="button button-secondary button-small"
+              type="button"
+              onClick={() => setShowScopeForm(true)}
+            >
+              <Plus size={14} /> Create writable scope
+            </button>
+          )}
           <span className="field-hint">
             Only Issues assigned to your GitHub account, in this Project, with this Status are
             synchronized. New Issues are triaged automatically; sufficient context starts ACP in the
@@ -3324,6 +3826,22 @@ function GitHubProjectIntegration({
         <p className="field-hint" role="status">
           {message}
         </p>
+      )}
+      {showScopeForm && localProject && (
+        <ScopeForm
+          project={localProject}
+          onClose={() => setShowScopeForm(false)}
+          onCreated={(scope) => {
+            if (scope.writeAccess) {
+              setExecutionScopeId(scope.id);
+              setMessage(`Writable scope “${scope.name}” selected.`);
+            } else {
+              setMessage(
+                'The new scope is read-only. Add a writable scope to connect this Project.',
+              );
+            }
+          }}
+        />
       )}
     </>
   );

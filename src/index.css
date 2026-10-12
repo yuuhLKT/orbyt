@@ -1998,6 +1998,200 @@ h1 {
   accent-color: #a58df8;
 }
 
+.first-run-page {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding-bottom: 30px;
+}
+.first-run-card {
+  overflow: hidden;
+  border: 1px solid #292d3a;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #171a24, #13151d 62%);
+  box-shadow: 0 22px 55px #00000022;
+}
+.first-run-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 14px 22px;
+  border-bottom: 1px solid #292d3a;
+  background: #11131a99;
+}
+.first-run-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 0;
+  color: #727889;
+  background: transparent;
+  text-align: left;
+  font-size: 10px;
+}
+.first-run-step:not(:disabled) {
+  cursor: pointer;
+}
+.first-run-step.active {
+  color: #e7e3f5;
+}
+.first-run-step.complete {
+  color: #7fd3ad;
+}
+.first-run-step-number {
+  width: 23px;
+  height: 23px;
+  flex: 0 0 23px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #373b49;
+  border-radius: 50%;
+  color: #8d93a2;
+  font-size: 9px;
+}
+.first-run-step.active .first-run-step-number {
+  border-color: #8f78dc;
+  color: #c0b0ff;
+  background: #302742;
+}
+.first-run-step.complete .first-run-step-number {
+  border-color: #396550;
+  color: #88ddb5;
+  background: #1b3028;
+}
+.first-run-content {
+  max-width: 700px;
+  min-height: 365px;
+  margin: 0 auto;
+  padding: 36px 34px 30px;
+}
+.first-run-content > h2 {
+  margin: 14px 0 7px;
+  color: #eeedf4;
+  font-size: 19px;
+  font-weight: 610;
+  letter-spacing: -0.3px;
+}
+.first-run-content > p {
+  margin: 0 0 21px;
+  color: #969baa;
+  font-size: 11px;
+  line-height: 1.65;
+}
+.first-run-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #3b3551;
+  border-radius: 11px;
+  color: #b7a5ff;
+  background: #272337;
+}
+.first-run-content > .button,
+.first-run-actions > .button {
+  min-height: 36px;
+}
+.first-run-existing-project {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  margin: 4px 0 20px;
+  padding: 14px;
+  border: 1px solid #2a2e3a;
+  border-radius: 8px;
+  background: #11131a88;
+}
+.first-run-existing-project .field-label {
+  min-width: 0;
+  margin: 0;
+}
+.first-run-actions,
+.first-run-finish {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 20px;
+}
+.first-run-opencode {
+  display: grid;
+  gap: 13px;
+  margin-top: 18px;
+}
+.first-run-opencode .field-label {
+  margin: 0;
+}
+.first-run-opencode .first-run-actions {
+  margin-top: 2px;
+}
+.first-run-success,
+.first-run-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 16px;
+  padding: 11px 12px;
+  border: 1px solid #305443;
+  border-radius: 7px;
+  color: #a8dfc2;
+  background: #192920;
+  font-size: 10px;
+  line-height: 1.55;
+}
+.first-run-success > svg,
+.first-run-note > svg {
+  flex: 0 0 16px;
+  margin-top: 1px;
+}
+.first-run-note {
+  border-color: #5b4b30;
+  color: #e0c38c;
+  background: #292317;
+}
+.first-run-content .settings-section {
+  margin-top: 19px;
+  padding: 13px;
+  background: #11131a80;
+}
+.first-run-content .settings-section-heading {
+  margin-bottom: 12px;
+}
+.first-run-content .settings-section-heading > div:last-child h2 {
+  margin: 0;
+  font-size: 12px;
+}
+.first-run-content .settings-section-heading > div:last-child p {
+  margin: 4px 0 0;
+}
+.first-run-content .settings-subsection {
+  margin-top: 12px;
+  padding-top: 12px;
+}
+.first-run-content .source-connections {
+  margin-top: 14px;
+}
+.first-run-finish {
+  justify-content: flex-end;
+  padding-top: 15px;
+  border-top: 1px solid #292d3a;
+}
+.first-run-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 22px;
+  border-top: 1px solid #292d3a;
+  color: #848a99;
+  font-size: 9px;
+}
+.first-run-footer strong {
+  color: #c8cad4;
+  font-weight: 560;
+}
+
 @media (min-width: 1500px) {
   .page-area {
     padding-right: 48px;
@@ -2025,6 +2219,24 @@ h1 {
   }
 }
 @media (max-width: 720px) {
+  .first-run-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    padding: 12px;
+  }
+  .first-run-content {
+    min-height: 0;
+    padding: 25px 18px;
+  }
+  .first-run-existing-project {
+    grid-template-columns: 1fr;
+  }
+  .first-run-finish {
+    justify-content: stretch;
+  }
+  .first-run-finish > .button {
+    flex: 1;
+  }
   .task-run-heading,
   .run-permission {
     align-items: stretch;

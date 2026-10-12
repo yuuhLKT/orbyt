@@ -67,6 +67,10 @@ cargo check
 
 `bun.lock` is the JavaScript dependency lockfile. Cargo uses `src-tauri/Cargo.toml` and its generated `Cargo.lock` for native dependencies.
 
+## First launch
+
+When the local database has no registered projects, the Overview opens a guided setup. Register an existing project folder, add a writable execution scope if GitHub tasks should be able to start automatically, and optionally verify OpenCode and connect GitHub/GLPI. Setup progress is saved locally without credentials, can resume after restarting Orbyt, and can be deferred; skipped source integrations can be configured later under Settings.
+
 ## GitHub and GLPI sources
 
 Open **Settings → External sources** and choose a local Orbyt project. For GitHub, create a GitHub App, enable Device Flow, request read-only access to Issues and Projects, install it in the organization/repositories, and enter its Client ID. Sign in with GitHub, enter the organization login, and choose the Project. Orbyt discovers single-select fields and options; it preselects `Status` and `Não Iniciado` when present. Select the desired Status option and a writable execution scope. Only open Issues assigned to the signed-in account and present in that Project with that Status are synced. GitHub App tokens are stored in the operating system credential store; Orbyt never needs the App private key or a Client Secret.
