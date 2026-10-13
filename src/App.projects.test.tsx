@@ -54,7 +54,7 @@ describe('project creation defaults', () => {
   it('uses the saved global concurrency default for a new project', async () => {
     renderProjects();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Add your first project' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Add project' }));
     expect(await screen.findByRole('dialog', { name: 'Add a project' })).toBeInTheDocument();
     fillNewProject();
 

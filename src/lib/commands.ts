@@ -16,6 +16,7 @@ import type {
   Project,
   SourceConnection,
   SourceSyncResult,
+  ProjectWorkflowResources,
   Task,
   TaskRun,
   TriageResult,
@@ -50,6 +51,7 @@ export const api = {
     title: string;
     description: string;
     priority: Task['priority'];
+    externalUrl: string | null;
   }) => invoke<Task>('create_task', { input }),
   updateTask: (
     taskId: string,
@@ -59,6 +61,7 @@ export const api = {
       title: string;
       description: string;
       priority: Task['priority'];
+      externalUrl: string | null;
     },
   ) => invoke<Task>('update_task', { taskId, input }),
   deleteTask: (taskId: string) => invoke<void>('delete_task', { taskId }),
@@ -128,6 +131,8 @@ export const api = {
     invoke<SourceSyncResult>('sync_source_connection', { connectionId }),
   verifyOpenCode: () => invoke<OpenCodeStatus>('verify_opencode'),
   openCodeSessions: () => invoke<OpenCodeSession[]>('list_opencode_sessions'),
+  projectWorkflowResources: (projectId: string) =>
+    invoke<ProjectWorkflowResources>('list_project_workflow_resources', { projectId }),
 };
 
 export function errorMessage(error: unknown): string {

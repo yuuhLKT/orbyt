@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ExecutionScope, Project, Task, TaskRun } from './types/domain';
+import type { ExecutionScope, Project, SourceConnection, Task, TaskRun } from './types/domain';
 import App from './App';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -71,6 +71,7 @@ const run: TaskRun = {
 let listedTask: Task = task;
 let listedRuns: TaskRun[] = [];
 let listedScopes: ExecutionScope[] = [];
+let listedConnections: SourceConnection[] = [];
 
 function renderTasks() {
   const queryClient = new QueryClient({
@@ -90,10 +91,12 @@ describe('task triage and workflow controls', () => {
     listedTask = task;
     listedRuns = [];
     listedScopes = [];
+    listedConnections = [];
     invokeMock.mockImplementation((command: string) => {
       if (command === 'list_projects') return Promise.resolve([project]);
       if (command === 'list_tasks') return Promise.resolve([listedTask]);
       if (command === 'list_scopes') return Promise.resolve(listedScopes);
+      if (command === 'list_source_connections') return Promise.resolve(listedConnections);
       if (command === 'list_task_runs') return Promise.resolve(listedRuns);
       if (command === 'get_task_triage') return Promise.resolve(null);
       if (command === 'triage_task')
@@ -115,16 +118,8 @@ describe('task triage and workflow controls', () => {
     renderTasks();
 
     expect(await screen.findByText('Add a settings screen')).toBeInTheDocument();
-    expect(
-      screen.getByText(/rules that already allow a tool action can let it run/i),
-    ).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Mark queued' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Mark running' })).not.toBeInTheDocument();
-    expect(
-      screen.getByText(
-        /Issue text and linked GLPI ticket text, public follow-ups, and attachment metadata to the configured model/i,
-      ),
-    ).toBeInTheDocument();
     fireEvent.click(screen.getByText('Actions'));
     fireEvent.click(await screen.findByRole('button', { name: 'Run triage' }));
 
@@ -132,6 +127,86 @@ describe('task triage and workflow controls', () => {
     expect(screen.getByText('Render the current settings.')).toBeInTheDocument();
     expect(screen.getByText(/Await manual approval/)).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('triage_task', { taskId: 'task-1' });
+  });
+
+  it('does not expose a GitHub Issue link path for manual tasks', async () => {
+    listedConnections = [
+      {
+        id: 'connection-1',
+        provider: 'github',
+        projectId: project.id,
+        sourceKey: 'owner/repo',
+        displayName: 'owner/repo',
+        apiEndpoint: 'https://api.github.com',
+        lastSyncedAt: null,
+        createdAt: '2026-10-10T00:00:00Z',
+        updatedAt: '2026-10-10T00:00:00Z',
+      },
+    ];
+    renderTasks();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New task' }));
+    expect(screen.queryByLabelText(/GitHub Issue URL/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/GLPI ticket URL/i)).not.toBeInTheDocument();
+  });
+
+  it('renders saved external URLs as accessible external links', async () => {
+    listedTask = {
+      ...task,
+      externalUrl: 'https://helpdesk.example.test/front/ticket.form.php?id=42',
+    };
+    renderTasks();
+
+    const link = await screen.findByRole('link', {
+      name: 'Open external link for Add a settings screen (opens in a new tab)',
+    });
+    expect(link).toHaveAttribute(
+      'href',
+      'https://helpdesk.example.test/front/ticket.form.php?id=42',
+    );
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noreferrer');
+  });
+
+  it('updates a manual task URL without changing its existing title or description', async () => {
+    listedConnections = [
+      {
+        id: 'connection-1',
+        provider: 'glpi',
+        projectId: project.id,
+        sourceKey: 'https://helpdesk.example.test',
+        displayName: 'Helpdesk',
+        apiEndpoint: 'https://helpdesk.example.test/apirest.php',
+        lastSyncedAt: null,
+        createdAt: '2026-10-10T00:00:00Z',
+        updatedAt: '2026-10-10T00:00:00Z',
+      },
+    ];
+    listedTask = {
+      ...task,
+      externalUrl: 'https://helpdesk.example.test/front/ticket.form.php?id=42',
+    };
+    renderTasks();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit Add a settings screen' }));
+    const urlInput = await screen.findByLabelText(/GLPI ticket URL/i);
+    expect(urlInput).toHaveValue(listedTask.externalUrl);
+    fireEvent.change(urlInput, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('update_task', {
+        taskId: task.id,
+        input: {
+          projectId: project.id,
+          scopeId: null,
+          title: task.title,
+          description: task.description,
+          priority: task.priority,
+          externalUrl: null,
+        },
+      });
+    });
   });
 
   it('exposes only legal state actions for the current status', async () => {

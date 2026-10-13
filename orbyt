@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+project_dir="$(cd -- "$(dirname -- "$script_path")" && pwd)"
+app="$project_dir/src-tauri/target/release/orbyt"
+
+if [[ ! -x "$app" ]]; then
+  printf 'Orbyt ainda não foi compilado. Execute `bun run tauri build` na pasta do projeto.\n' >&2
+  exit 1
+fi
+
+exec "$app" "$@"

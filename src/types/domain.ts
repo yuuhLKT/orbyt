@@ -188,6 +188,32 @@ export type SourceSyncResult = {
   truncated: boolean;
   limit: number;
   syncedAt: string;
+  triageTaskIds: string[];
+};
+
+export type WorkflowResource = {
+  name: string;
+  relativePath: string;
+  description: string;
+  readable: boolean;
+  parseable: boolean;
+};
+
+export type ProjectWorkflowResources = {
+  workingDirectory: string;
+  discoveryNote: string;
+  counts: {
+    skills: number;
+    commands: number;
+    agents: number;
+    instructions: number;
+    configs: number;
+  };
+  skills: WorkflowResource[];
+  commands: WorkflowResource[];
+  agents: WorkflowResource[];
+  instructions: WorkflowResource[];
+  configs: WorkflowResource[];
 };
 
 export type GitHubAccount = { id: number; login: string };

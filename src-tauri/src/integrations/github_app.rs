@@ -43,6 +43,8 @@ pub enum GitHubAppError {
     ReauthorizationRequired,
     #[error("the GitHub request could not be completed")]
     RequestFailed,
+    #[error("GitHub Device Flow setup failed (HTTP 404); check the GitHub App Client ID (not the numeric App ID) and enable Device Flow for the app")]
+    DeviceFlowSetup,
     #[error("GitHub returned an invalid response")]
     InvalidResponse,
     #[error("GitHub rejected the request (HTTP {0})")]
@@ -276,7 +278,7 @@ impl GitHubApp {
             .send()
             .await
             .map_err(|_| GitHubAppError::RequestFailed)?;
-        let body = read_json(response).await?;
+        let body = read_device_flow_json(response).await?;
 
         let device_code = required_string(&body, "device_code", 256)?;
         let user_code = required_string(&body, "user_code", 32)?;
@@ -347,7 +349,7 @@ impl GitHubApp {
             .send()
             .await
             .map_err(|_| GitHubAppError::RequestFailed)?;
-        let body = read_json(response).await?;
+        let body = read_device_flow_json(response).await?;
 
         match body.get("error").and_then(Value::as_str) {
             Some("authorization_pending") => {
@@ -919,6 +921,13 @@ async fn read_json(response: Response) -> Result<Value, GitHubAppError> {
     serde_json::from_slice(&bytes).map_err(|_| GitHubAppError::InvalidResponse)
 }
 
+async fn read_device_flow_json(response: Response) -> Result<Value, GitHubAppError> {
+    if response.status().as_u16() == 404 {
+        return Err(GitHubAppError::DeviceFlowSetup);
+    }
+    read_json(response).await
+}
+
 struct PageInfo {
     has_next_page: bool,
     end_cursor: Option<String>,
@@ -1332,6 +1341,25 @@ mod tests {
         assert!(json.get("deviceCode").is_none());
         assert!(validate_user_code("ABCD-1234").is_ok());
         assert!(validate_user_code("https://evil").is_err());
+    }
+
+    #[tokio::test]
+    async fn device_flow_404_explains_safe_app_setup_diagnostic() {
+        let (base, server) =
+            start_mock_server(vec![(404, json!({"message":"secret response text"}), None)]);
+        let app = test_app("Iv1.test-client", base, Arc::new(MemoryStore::default()));
+
+        let error = app
+            .begin_device_flow()
+            .await
+            .err()
+            .expect("a missing Device Flow endpoint is rejected");
+        let message = error.to_string();
+        assert!(message.contains("Client ID (not the numeric App ID)"));
+        assert!(message.contains("enable Device Flow"));
+        assert!(!message.contains("secret response text"));
+        assert!(matches!(error, GitHubAppError::DeviceFlowSetup));
+        server.join().expect("mock server completes");
     }
 
     #[tokio::test]

@@ -63,4 +63,57 @@ describe('OpenCode sessions screen', () => {
     expect(screen.getByText('Read-only session listing')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('list_opencode_sessions');
   });
+
+  it('shows no more than 15 sessions when the native command returns more', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'list_projects')
+        return Promise.resolve([
+          {
+            id: 'project-1',
+            name: 'Orbyt',
+            description: '',
+            directory: '/work/orbyt',
+            maxConcurrentSessions: 2,
+            approvalPolicy: 'manual',
+            createdAt: '2026-10-10T00:00:00Z',
+            updatedAt: '2026-10-10T00:00:00Z',
+          },
+        ]);
+      if (command === 'list_tasks') return Promise.resolve([]);
+      if (command === 'list_opencode_sessions')
+        return Promise.resolve(
+          Array.from({ length: 16 }, (_, index) => ({
+            id: `ses_${index + 1}`,
+            projectId: 'project-1',
+            projectName: 'Orbyt',
+            projectDirectory: '/work/orbyt',
+            title: `Session ${index + 1}`,
+            createdAt: 1_791_600_000_000,
+            updatedAt: 1_791_600_100_000,
+            parentId: null,
+          })),
+        );
+      return Promise.resolve({});
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/sessions']}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(
+        'Orbyt checks the latest 15 sessions across your registered projects and displays at most 15. It does not start, prompt, or schedule sessions from this screen.',
+      ),
+    ).toBeInTheDocument();
+    expect(await screen.findByText('Session 15')).toBeInTheDocument();
+    expect(screen.queryByText('Session 16')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.session-row')).toHaveLength(15);
+  });
 });

@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { open } from '@tauri-apps/plugin-dialog';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import {
   isPermissionGranted,
   requestPermission,
@@ -24,6 +23,7 @@ import {
   FolderOpen,
   Gauge,
   GitBranch,
+  GitPullRequest,
   Paperclip,
   ExternalLink,
   Layers3,
@@ -44,8 +44,6 @@ import { api, errorMessage } from './lib/commands';
 import { availableTransitions } from './lib/task-rules';
 import type {
   ExecutionScope,
-  DeviceFlowPrompt,
-  GitHubProjectField,
   OpenCodeSession,
   Project,
   Task,
@@ -151,7 +149,7 @@ function App() {
   return (
     <div className="app-shell">
       <ReviewNotifications />
-      <GitHubProjectSyncScheduler />
+      <GlpiSyncScheduler />
       <Sidebar />
       <div className="app-main">
         <Topbar />
@@ -161,6 +159,7 @@ function App() {
             <Route path="/projects" element={<Projects />} />
             <Route path="/projects/:projectId" element={<ProjectDetail />} />
             <Route path="/tasks" element={<Tasks />} />
+            <Route path="/flow" element={<Flow />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
@@ -230,6 +229,7 @@ function Sidebar() {
     { to: '/', label: 'Overview', icon: Gauge, end: true },
     { to: '/projects', label: 'Projects', icon: FolderKanban },
     { to: '/tasks', label: 'Tasks', icon: Layers3 },
+    { to: '/flow', label: 'Flow', icon: GitPullRequest },
     { to: '/sessions', label: 'Sessions', icon: SquareTerminal },
   ];
   return (
@@ -721,7 +721,8 @@ function FirstRunOnboarding({
               <h2 id="first-run-step-title">Choose a writable execution scope</h2>
               <p>
                 A scope identifies the part of this project where OpenCode may make changes. It is
-                required for automatic GitHub task execution.
+                the scheduler boundary for approved implementation work, not an operating-system
+                sandbox.
               </p>
               {!project ? (
                 <LoadingState label="Loading your project" />
@@ -740,8 +741,7 @@ function FirstRunOnboarding({
                 <div className="first-run-note">
                   <TriangleAlert size={16} />
                   <span>
-                    No writable scope yet. You can continue, but GitHub automatic execution will
-                    stay unavailable until one is added.
+                    No writable scope yet. You can continue and add one later before implementation.
                   </span>
                 </div>
               )}
@@ -850,11 +850,10 @@ function FirstRunOnboarding({
               <div className="first-run-icon">
                 <GitBranch size={20} />
               </div>
-              <h2 id="first-run-step-title">Connect GitHub and GLPI</h2>
+              <h2 id="first-run-step-title">Connect GLPI</h2>
               <p>
-                Sign in with your GitHub App, select the Project and its pending Status, then add
-                your GLPI 10 API URL and tokens to load linked ticket context. Both sources are
-                optional.
+                Connect a GLPI 10 instance to import tickets and load linked ticket context. This is
+                optional and can be configured later in Settings.
               </p>
               {project ? (
                 <SourceIntegrations lockedProjectId={project.id} />
@@ -903,7 +902,7 @@ function FirstRunOnboarding({
             setScopeMessage(
               scope.writeAccess
                 ? `Writable scope “${scope.name}” added.`
-                : 'This scope is read-only. Add a writable scope to enable automatic GitHub execution.',
+                : 'This scope is read-only. Add a writable scope before starting implementation.',
             );
             if (scope.writeAccess) goTo(2);
           }}
@@ -1338,8 +1337,7 @@ function ProjectDetail() {
         <div>
           <span className="summary-label">Approval policy</span>
           <strong>
-            <ShieldCheck size={15} /> Manual for local tasks · automatic for configured GitHub
-            intake
+            <ShieldCheck size={15} /> Explicit approval required before implementation
           </strong>
         </div>
         <div>
@@ -1555,20 +1553,6 @@ function Tasks() {
         }
       />
       {(error || remove.error) && <ErrorBanner message={errorMessage(error ?? remove.error)} />}
-      <div className="session-notice" role="note">
-        <ShieldCheck size={17} />
-        <div>
-          <strong>Supervised implementation</strong>
-          <p>
-            Local tasks wait for approval. GitHub Project tasks can start automatically after
-            sufficient-context triage in their configured writable scope. OpenCode rules that
-            already allow a tool action can let it run without a separate permission request.
-            Project scopes are scheduler boundaries, not OS-level filesystem isolation. Triage sends
-            the Issue text and linked GLPI ticket text, public follow-ups, and attachment metadata
-            to the configured model; it does not read project files or attachment bytes.
-          </p>
-        </div>
-      </div>
       <div className="toolbar task-toolbar">
         <div className="filter-group">
           <label className="select-filter">
@@ -1685,6 +1669,264 @@ function Tasks() {
   );
 }
 
+const FLOW_STAGES = [
+  {
+    id: 'intake',
+    title: 'GLPI intake',
+    statuses: ['pending'] as TaskStatus[],
+    detail:
+      'A connected GLPI 10 source is polled while Orbyt is open (on startup and every five minutes). Imported ticket text is stored as a task; automatic triage is separately opt-in.',
+  },
+  {
+    id: 'triage',
+    title: 'Stateless triage',
+    statuses: ['triaging'] as TaskStatus[],
+    detail:
+      'Triage sends task text plus linked GLPI ticket text, public follow-ups, and attachment metadata to the configured OpenCode model. It does not inspect repository files, invoke tools, create a session, or send attachment bytes.',
+  },
+  {
+    id: 'context',
+    title: 'Context needed',
+    statuses: ['awaiting_context'] as TaskStatus[],
+    detail:
+      'When the task lacks context, Orbyt can prepare a public follow-up question from the triage report. You review the exact message and explicitly confirm before it is posted to GLPI; replies can then be triaged again.',
+  },
+  {
+    id: 'approval',
+    title: 'Approval gate',
+    statuses: ['awaiting_approval'] as TaskStatus[],
+    detail:
+      'Sufficient context leads here. Starting implementation always requires explicit user approval; GLPI auto-triage never auto-starts ACP execution.',
+  },
+  {
+    id: 'executor',
+    title: 'OpenCode ACP',
+    statuses: ['queued', 'running', 'needs_reconciliation'] as TaskStatus[],
+    detail:
+      'After approval, the private ACP executor starts in the registered project root so project-wide context remains available. The writable scope coordinates Orbyt runs but is not an OS sandbox; OpenCode’s effective permissions remain authoritative.',
+  },
+  {
+    id: 'review',
+    title: 'Awaiting review',
+    statuses: ['awaiting_review'] as TaskStatus[],
+    detail:
+      'A finished implementation returns to Orbyt for your review. Inspect the outcome before marking the task complete.',
+  },
+] as const;
+
+function Flow() {
+  const { data: tasks, isLoading, error } = useTasks();
+  const { data: projects = [] } = useProjects();
+  const [selectedProjectId, setSelectedProjectId] = useState('');
+  const projectId = selectedProjectId || projects[0]?.id || '';
+  const {
+    data: resources,
+    isLoading: resourcesLoading,
+    error: resourcesError,
+  } = useQuery({
+    queryKey: ['project-workflow-resources', projectId],
+    queryFn: () => api.projectWorkflowResources(projectId),
+    enabled: Boolean(projectId),
+  });
+  const [selected, setSelected] = useState<string>('intake');
+  const [syncWarning, setSyncWarning] = useState('');
+  const selectedStage = FLOW_STAGES.find((stage) => stage.id === selected) ?? FLOW_STAGES[0];
+  useEffect(() => {
+    const handleWarning = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      if (detail) setSyncWarning(detail);
+    };
+    window.addEventListener('orbyt:glpi-sync-warning', handleWarning);
+    return () => window.removeEventListener('orbyt:glpi-sync-warning', handleWarning);
+  }, []);
+  return (
+    <>
+      <PageHeading
+        eyebrow="WORKFLOW"
+        title="Flow"
+        description="How GLPI tickets move through Orbyt, from intake to your review."
+      />
+      {error && <ErrorBanner message={errorMessage(error)} />}
+      {syncWarning && (
+        <div className="settings-note" role="status">
+          {syncWarning}
+        </div>
+      )}
+      {isLoading || !tasks ? (
+        <LoadingState label="Loading workflow task counts" />
+      ) : (
+        <>
+          <section className="panel" aria-label="Task workflow stages" style={{ padding: 22 }}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                gap: 14,
+                alignItems: 'stretch',
+              }}
+            >
+              {FLOW_STAGES.map((stage, index) => {
+                const count = tasks.filter((task) => stage.statuses.includes(task.status)).length;
+                return (
+                  <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <button
+                      type="button"
+                      className={`metric-card${selected === stage.id ? ' active' : ''}`}
+                      aria-pressed={selected === stage.id}
+                      aria-label={`${stage.title}, ${count} current ${count === 1 ? 'task' : 'tasks'}`}
+                      onClick={() => setSelected(stage.id)}
+                      style={{ textAlign: 'left', width: '100%', cursor: 'pointer' }}
+                    >
+                      <span className="metric-label">{stage.title}</span>
+                      <span className="metric-value">{count.toString().padStart(2, '0')}</span>
+                      <span className="metric-note">current tasks</span>
+                    </button>
+                    {index < FLOW_STAGES.length - 1 && (
+                      <ArrowRight aria-hidden="true" size={17} style={{ flex: '0 0 auto' }} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="field-hint" style={{ marginTop: 14 }}>
+              Triage branches: missing context → reviewed public GLPI question; sufficient context →
+              explicit approval → ACP. A do-not-proceed recommendation becomes blocked.
+            </p>
+            <div
+              aria-label="Triage decision branches"
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                gap: 12,
+                marginTop: 12,
+              }}
+            >
+              <div className="mini-empty">
+                <strong>
+                  Needs context ·{' '}
+                  {tasks.filter((task) => task.status === 'awaiting_context').length}
+                </strong>
+                <p>Review a proposed public follow-up, then wait for a ticket reply.</p>
+              </div>
+              <div className="mini-empty">
+                <strong>
+                  Sufficient · {tasks.filter((task) => task.status === 'awaiting_approval').length}
+                </strong>
+                <p>Wait at the user approval gate before an ACP run can start.</p>
+              </div>
+              <div className="mini-empty">
+                <strong>
+                  Do not proceed · {tasks.filter((task) => task.status === 'blocked').length}
+                </strong>
+                <p>Triage may recommend blocking instead of continuing.</p>
+              </div>
+            </div>
+          </section>
+          <section className="panel" aria-live="polite" style={{ padding: 22, marginTop: 16 }}>
+            <div className="panel-heading">
+              <div>
+                <h2>{selectedStage.title}</h2>
+                <p>
+                  {tasks.filter((task) => selectedStage.statuses.includes(task.status)).length}{' '}
+                  current tasks in this stage
+                </p>
+              </div>
+            </div>
+            <p>{selectedStage.detail}</p>
+            {tasks.filter((task) => selectedStage.statuses.includes(task.status)).length === 0 ? (
+              <p className="empty-copy">No tasks are currently in this stage.</p>
+            ) : (
+              <ul>
+                {tasks
+                  .filter((task) => selectedStage.statuses.includes(task.status))
+                  .map((task) => (
+                    <li key={task.id}>
+                      {task.title} · {formatStatus(task.status)}
+                    </li>
+                  ))}
+              </ul>
+            )}
+          </section>
+          <section className="panel" style={{ padding: 22, marginTop: 16 }}>
+            <h2>Observed project resources</h2>
+            {projects.length > 1 && (
+              <label className="field-label">
+                Project root
+                <select
+                  value={projectId}
+                  onChange={(event) => setSelectedProjectId(event.target.value)}
+                >
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name} · {project.directory}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {resourcesLoading ? (
+              <LoadingState label="Checking project resources" />
+            ) : resourcesError ? (
+              <ErrorBanner message={errorMessage(resourcesError)} />
+            ) : resources ? (
+              <>
+                <p>
+                  Working directory: <code>{resources.workingDirectory}</code>
+                </p>
+                <p>{resources.discoveryNote}</p>
+                {(
+                  [
+                    ['Skills', resources.skills],
+                    ['Commands', resources.commands],
+                    ['Agents', resources.agents],
+                    ['Instructions', resources.instructions],
+                    ['OpenCode configs', resources.configs],
+                  ] as const
+                ).map(([label, items]) => (
+                  <div key={label}>
+                    <strong>
+                      {label} identified · {items.length}
+                    </strong>
+                    {items.length === 0 ? (
+                      <p className="empty-copy">None detected in the supported project paths.</p>
+                    ) : (
+                      <ul>
+                        {items.map((item) => (
+                          <li key={item.relativePath}>
+                            <code>{item.name}</code> · <code>{item.relativePath}</code>
+                            {item.description ? ` — ${item.description}` : ''}
+                            {!item.readable && ' · unreadable or over the inspection limit'}
+                            {item.readable && !item.parseable && ' · not parseable'}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ))}
+              </>
+            ) : (
+              <p className="empty-copy">Add a project to inspect its project-level resources.</p>
+            )}
+            <p>
+              Recent project sessions observed the <code>build</code> command; that is session
+              history, not proof that a resource loaded in every ACP run or a named Orbyt
+              triage/executor agent.
+            </p>
+            <div className="scope-security-note" role="note">
+              <TriangleAlert size={15} />
+              <span>
+                The configured <code>plugins/</code> write scope is broad. Scheduler scopes
+                coordinate Orbyt work; they are not an OS sandbox, and OpenCode’s effective
+                permissions still apply.
+              </span>
+            </div>
+          </section>
+        </>
+      )}
+    </>
+  );
+}
+
 function TaskRow({
   task,
   projects,
@@ -1756,9 +1998,20 @@ function TaskRow({
             <span>{task.description || 'No additional description'}</span>
             {task.source !== 'manual' && (
               <small className="task-source-reference">
-                {task.source === 'github' ? 'GitHub' : 'GLPI'} · {task.externalReference}
+                {task.source === 'github' ? 'Legacy source' : 'GLPI'} · {task.externalReference}
                 {task.externalStatus ? ` · remote: ${task.externalStatus}` : ''}
               </small>
+            )}
+            {task.externalUrl && task.source !== 'github' && (
+              <a
+                className="task-source-reference"
+                href={task.externalUrl}
+                target="_blank"
+                rel="noreferrer"
+                aria-label={`Open external link for ${task.title} (opens in a new tab)`}
+              >
+                <ExternalLink size={13} /> Open linked GLPI ticket
+              </a>
             )}
           </div>
         </div>
@@ -2533,7 +2786,7 @@ function TriageReport({ result, taskStatus }: { result: TriageResult; taskStatus
             {actionLabel}
           </p>
           <p>
-            Suggestions use the Issue and linked GLPI text, public follow-ups, and attachment
+            Suggestions use task text and linked GLPI text, public follow-ups, and attachment
             metadata; Orbyt did not inspect project files or send attachment bytes.
           </p>
         </div>
@@ -2580,6 +2833,18 @@ function TaskForm({
   const [projectId, setProjectId] = useState(task?.projectId ?? projects[0]?.id ?? '');
   const [scopeId, setScopeId] = useState(task?.scopeId ?? '');
   const [message, setMessage] = useState('');
+  const {
+    data: sourceConnections = [],
+    isLoading: sourceConnectionsLoading,
+    error: sourceConnectionsError,
+  } = useQuery({
+    queryKey: ['source-connections', projectId],
+    queryFn: () => api.sourceConnections(projectId),
+    enabled: Boolean(projectId),
+  });
+  const configuredProviders = [
+    ...new Set(sourceConnections.map((connection) => connection.provider)),
+  ];
   const { data: scopeData } = useQuery({
     queryKey: ['scopes', projectId],
     queryFn: () => api.scopes(projectId),
@@ -2594,6 +2859,7 @@ function TaskForm({
       title: string;
       description: string;
       priority: Task['priority'];
+      externalUrl: string | null;
     }) => (task ? api.updateTask(task.id, input) : api.createTask(input)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.tasks });
@@ -2614,6 +2880,7 @@ function TaskForm({
       title: String(data.get('title')).trim(),
       description: String(data.get('description')).trim(),
       priority: String(data.get('priority')) as Task['priority'],
+      externalUrl: String(data.get('externalUrl') ?? '').trim() || null,
     });
   }
   return (
@@ -2643,6 +2910,30 @@ function TaskForm({
             placeholder="Add requirements, context, or acceptance criteria..."
           />
         </label>
+        {sourceConnectionsError && (
+          <ErrorBanner
+            message={`Could not check configured task sources: ${errorMessage(sourceConnectionsError)}`}
+          />
+        )}
+        {sourceConnectionsLoading && (
+          <span className="field-hint">Checking connected ticket sources…</span>
+        )}
+        {configuredProviders.includes('glpi') && (
+          <label className="field-label">
+            GLPI ticket URL <span className="optional">Optional</span>
+            <input
+              name="externalUrl"
+              type="url"
+              defaultValue={task?.externalUrl ?? ''}
+              placeholder="https://…"
+              aria-describedby="external-url-hint"
+            />
+            <span className="field-hint" id="external-url-hint">
+              Use a supported ticket link from the connected GLPI instance. Orbyt validates its
+              origin and ticket number before using it for context.
+            </span>
+          </label>
+        )}
         <label className="field-label">
           Project
           <select
@@ -2762,8 +3053,8 @@ function Sessions() {
         <div>
           <strong>Read-only session listing</strong>
           <p>
-            Orbyt checks the latest 100 sessions in each registered project folder. It does not
-            start, prompt, or schedule sessions from this screen.
+            Orbyt checks the latest 15 sessions across your registered projects and displays at most
+            15. It does not start, prompt, or schedule sessions from this screen.
           </p>
           <Link className="text-link" to="/settings">
             Check OpenCode connection <ArrowRight size={14} />
@@ -2798,7 +3089,7 @@ function Sessions() {
         />
       ) : sessions.length > 0 ? (
         <section className="panel session-list">
-          {sessions.map((session) => (
+          {sessions.slice(0, 15).map((session) => (
             <OpenCodeSessionRow session={session} key={session.id} />
           ))}
         </section>
@@ -3017,10 +3308,7 @@ function Settings() {
                 </div>
                 <div>
                   <strong>Context-gated execution</strong>
-                  <span>
-                    Local tasks need approval; configured GitHub Projects may auto-start after
-                    triage.
-                  </span>
+                  <span>All implementation runs require your explicit approval after triage.</span>
                 </div>
                 <span className="required-badge">Scope-bound</span>
               </div>
@@ -3081,6 +3369,7 @@ function Settings() {
 
 function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = {}) {
   const queryClient = useQueryClient();
+  const { data: settings = {}, isLoading: settingsLoading } = useAppSettings();
   const { data: projects = [] } = useProjects();
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [glpiEndpoint, setGlpiEndpoint] = useState('');
@@ -3096,6 +3385,7 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
     queryKey: ['source-connections'],
     queryFn: () => api.sourceConnections(),
   });
+  const glpiConnections = connections.filter((connection) => connection.provider === 'glpi');
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['source-connections'] });
     void queryClient.invalidateQueries({ queryKey: keys.tasks });
@@ -3114,7 +3404,7 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
       setMessage(`Connected to GLPI at ${connection.displayName}.`);
       refresh();
     },
-    onError: (cause) => setMessage(errorMessage(cause)),
+    onError: () => setMessage(''),
   });
   const disconnect = useMutation({
     mutationFn: api.deleteSourceConnection,
@@ -3132,15 +3422,15 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
           <GitBranch size={18} />
         </div>
         <div>
-          <h2>External task sources</h2>
-          <p>Receive assigned GitHub Project issues and load the linked GLPI 10 ticket context.</p>
+          <h2>GLPI ticket source</h2>
+          <p>Import GLPI 10 tickets and load linked ticket context.</p>
         </div>
       </div>
       {projects.length === 0 ? (
         <EmptyState
           icon={<FolderKanban size={18} />}
           title="Add a project first"
-          description="Imported issues and tickets need a local Orbyt project to belong to."
+          description="Imported GLPI tickets need a local Orbyt project to belong to."
         />
       ) : (
         <>
@@ -3165,9 +3455,6 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
               </select>
             </label>
           )}
-          <div className="settings-subsection">
-            <GitHubProjectIntegration key={projectId} projectId={projectId} onChanged={refresh} />
-          </div>
           <div className="settings-subsection">
             <h3>GLPI 10 instance</h3>
             <label className="field-label">
@@ -3202,6 +3489,36 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
                 saved in Orbyt.
               </span>
             </label>
+            <label className="check-field">
+              <input
+                type="checkbox"
+                checked={settings['glpi_auto_triage'] === 'true'}
+                disabled={settingsLoading}
+                onChange={(event) => {
+                  setMessage('');
+                  void api
+                    .saveSetting('glpi_auto_triage', String(event.target.checked))
+                    .then(() => queryClient.invalidateQueries({ queryKey: keys.settings }))
+                    .then(() =>
+                      setMessage(
+                        event.target.checked
+                          ? 'GLPI auto-triage enabled.'
+                          : 'GLPI auto-triage disabled.',
+                      ),
+                    )
+                    .catch((cause: unknown) => setMessage(errorMessage(cause)));
+                }}
+              />
+              <span>
+                <strong>Automatically triage newly imported GLPI tasks</strong>
+                <small>
+                  Off by default. When enabled, ticket text, public follow-ups, and attachment
+                  metadata are sent to the model configured in OpenCode for triage. Attachment bytes
+                  are never sent. This does not automatically start implementation or an ACP
+                  session.
+                </small>
+              </span>
+            </label>
             <button
               className="button button-secondary"
               onClick={() => connectGlpi.mutate()}
@@ -3216,6 +3533,7 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
               )}
               Connect GLPI
             </button>
+            {connectGlpi.error && <ErrorBanner message={errorMessage(connectGlpi.error)} />}
           </div>
           {message && (
             <p className="field-hint" role="status">
@@ -3227,18 +3545,14 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
             <h3>Connected sources</h3>
             {isLoading ? (
               <LoadingState label="Loading source connections" />
-            ) : connections.length === 0 ? (
+            ) : glpiConnections.length === 0 ? (
               <p className="empty-copy">No external sources connected yet.</p>
             ) : (
-              connections.map((connection) => (
+              glpiConnections.map((connection) => (
                 <div className="source-connection-row" key={connection.id}>
                   <div>
                     <strong>{connection.displayName}</strong>
-                    <span>
-                      {connection.provider === 'github'
-                        ? 'Legacy repository token connection · no longer synced'
-                        : 'GLPI 10 lookup for linked tickets'}
-                    </span>
+                    <span>GLPI 10 ticket intake and linked-ticket context</span>
                   </div>
                   <div className="source-connection-actions">
                     <button
@@ -3260,56 +3574,66 @@ function SourceIntegrations({ lockedProjectId }: { lockedProjectId?: string } = 
   );
 }
 
-const AUTO_TRIAGE_PER_SYNC = 3;
-
-async function syncAndTriageGitHubProject(projectId: string) {
-  const result = await api.syncGitHubProjectSource(projectId);
-  let triaged = 0;
-  let triageFailures = 0;
-  for (const taskId of result.triageTaskIds.slice(0, AUTO_TRIAGE_PER_SYNC)) {
-    try {
-      await api.triageTask(taskId);
-      triaged += 1;
-    } catch {
-      triageFailures += 1;
-    }
-  }
-  return { result, triaged, triageFailures };
-}
-
-function GitHubProjectSyncScheduler() {
+function GlpiSyncScheduler() {
   const queryClient = useQueryClient();
   const { data: sourceData } = useQuery({
-    queryKey: ['github-project-sources'],
-    queryFn: () => api.githubProjectSources(),
+    queryKey: ['source-connections'],
+    queryFn: () => api.sourceConnections(),
   });
-  const sources = Array.isArray(sourceData) ? sourceData : [];
+  const { data: settings = {} } = useAppSettings();
+  const sources = (Array.isArray(sourceData) ? sourceData : []).filter(
+    (source) => source.provider === 'glpi',
+  );
   const running = useRef(false);
-  const projectIds = sources.map((source) => source.projectId).join('\u0000');
+  const sourceIds = sources.map((source) => source.id).join('\u0000');
+  const autoTriage = settings['glpi_auto_triage'] === 'true';
+  const autoTriageRef = useRef(autoTriage);
 
   useEffect(() => {
-    if (!projectIds) return;
-    const sourceProjectIds = projectIds.split('\u0000');
+    autoTriageRef.current = autoTriage;
+  }, [autoTriage]);
+
+  useEffect(() => {
+    if (!sourceIds) return;
+    const connectionIds = sourceIds.split('\u0000');
     let active = true;
     const syncAll = async () => {
       if (running.current) return;
       running.current = true;
       let changed = false;
       try {
-        for (const sourceProjectId of sourceProjectIds) {
+        for (const connectionId of connectionIds) {
           if (!active) break;
           try {
-            await syncAndTriageGitHubProject(sourceProjectId);
+            const result = await api.syncSourceConnection(connectionId);
+            if (result.truncated) {
+              window.dispatchEvent(
+                new CustomEvent('orbyt:glpi-sync-warning', {
+                  detail: `GLPI intake reached its ${result.limit}-ticket safety limit; more unresolved tickets may remain to import.`,
+                }),
+              );
+            }
+            if (autoTriageRef.current) {
+              const { triageTaskIds = [] } = result as typeof result & { triageTaskIds?: string[] };
+              for (const taskId of triageTaskIds) {
+                if (!active) break;
+                try {
+                  await api.triageTask(taskId);
+                } catch {
+                  // A failed triage remains visible on the task and may be retried manually.
+                }
+              }
+            }
             changed = true;
           } catch {
-            // Settings expose the latest successful sync time; retry on the next interval.
+            // Retry the GLPI connection on the next scheduled cycle.
           }
         }
       } finally {
         running.current = false;
         if (active && changed) {
           void queryClient.invalidateQueries({ queryKey: keys.tasks });
-          void queryClient.invalidateQueries({ queryKey: ['github-project-sources'] });
+          void queryClient.invalidateQueries({ queryKey: ['source-connections'] });
         }
       }
     };
@@ -3319,532 +3643,9 @@ function GitHubProjectSyncScheduler() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [projectIds, queryClient]);
+  }, [sourceIds, queryClient]);
 
   return null;
-}
-
-function normalizeOptionName(value: string) {
-  return value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLocaleLowerCase();
-}
-
-function GitHubProjectIntegration({
-  projectId,
-  onChanged,
-}: {
-  projectId: string;
-  onChanged: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const { data: settings = {} } = useAppSettings();
-  const { data: localProjects = [] } = useProjects();
-  const localProject = localProjects.find((project) => project.id === projectId);
-  const { data: scopes = [] } = useQuery({
-    queryKey: ['scopes', projectId],
-    queryFn: () => api.scopes(projectId),
-    enabled: Boolean(projectId),
-  });
-  const [clientIdDraft, setClientIdDraft] = useState<string | null>(null);
-  const [organization, setOrganization] = useState('');
-  const [projectNumber, setProjectNumber] = useState('');
-  const [statusFieldId, setStatusFieldId] = useState('');
-  const [pendingOptionId, setPendingOptionId] = useState('');
-  const [executionScopeId, setExecutionScopeId] = useState('');
-  const [editingConfig, setEditingConfig] = useState(false);
-  const [showScopeForm, setShowScopeForm] = useState(false);
-  const [devicePrompt, setDevicePrompt] = useState<DeviceFlowPrompt | null>(null);
-  const [message, setMessage] = useState('');
-  const clientId = settings.github_app_client_id?.trim() ?? '';
-  const clientIdInput = clientIdDraft ?? clientId;
-  const sourcesQuery = useQuery({
-    queryKey: ['github-project-sources', projectId],
-    queryFn: () => api.githubProjectSources(projectId),
-    enabled: Boolean(projectId),
-  });
-  const configuredSource = sourcesQuery.data?.[0];
-  const accountQuery = useQuery({
-    queryKey: ['github-app-account', clientId],
-    queryFn: api.githubAppAccount,
-    enabled: Boolean(clientId),
-    retry: false,
-  });
-  const projectsQuery = useQuery({
-    queryKey: ['github-organization-projects', clientId, organization],
-    queryFn: () => api.githubOrganizationProjects(organization.trim()),
-    enabled: Boolean(clientId && accountQuery.data && organization.trim()),
-  });
-  const numericProjectNumber = Number(projectNumber);
-  const fieldsQuery = useQuery({
-    queryKey: ['github-project-fields', clientId, organization, numericProjectNumber],
-    queryFn: () => api.githubProjectFields(organization.trim(), numericProjectNumber),
-    enabled: Boolean(
-      clientId && accountQuery.data && organization.trim() && numericProjectNumber > 0,
-    ),
-  });
-  const availableFields = Array.isArray(fieldsQuery.data) ? fieldsQuery.data : [];
-  const singleSelectFields = availableFields.filter(
-    (field) => field.fieldType === 'ProjectV2SingleSelectField' && field.options.length > 0,
-  );
-  const defaultStatusField = singleSelectFields.find(
-    (field) => normalizeOptionName(field.name) === 'status',
-  );
-  const effectiveStatusFieldId = singleSelectFields.some((field) => field.id === statusFieldId)
-    ? statusFieldId
-    : ((defaultStatusField ?? singleSelectFields[0])?.id ?? '');
-  const selectedField: GitHubProjectField | undefined = singleSelectFields.find(
-    (field) => field.id === effectiveStatusFieldId,
-  );
-  const defaultPendingOption = selectedField?.options.find(
-    (option) => normalizeOptionName(option.name) === 'nao iniciado',
-  );
-  const effectivePendingOptionId = selectedField?.options.some(
-    (option) => option.id === pendingOptionId,
-  )
-    ? pendingOptionId
-    : ((defaultPendingOption ?? selectedField?.options[0])?.id ?? '');
-  const selectedScope = scopes.find((scope) => scope.id === executionScopeId && scope.writeAccess);
-
-  useEffect(() => {
-    if (!devicePrompt) return;
-    let active = true;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const result = await api.githubAppPollDeviceFlow();
-        if (!active) return;
-        if (result.status === 'pending') {
-          timer = window.setTimeout(() => void poll(), Math.max(1, result.data.interval) * 1000);
-          return;
-        }
-        setDevicePrompt(null);
-        if (result.status === 'authorized') {
-          setMessage(`Connected to GitHub as ${result.data.account.login}.`);
-          await queryClient.invalidateQueries({ queryKey: ['github-app-account'] });
-          return;
-        }
-        setMessage(
-          result.status === 'denied'
-            ? 'GitHub authorization was denied.'
-            : 'GitHub device code expired. Start again.',
-        );
-      } catch (cause) {
-        if (active) {
-          setDevicePrompt(null);
-          setMessage(errorMessage(cause));
-        }
-      }
-    };
-    timer = window.setTimeout(() => void poll(), Math.max(1, devicePrompt.interval) * 1000);
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [devicePrompt, queryClient]);
-
-  const saveClientId = useMutation({
-    mutationFn: async () => {
-      const nextClientId = clientIdInput.trim();
-      if (clientId && clientId !== nextClientId) await api.githubAppLogout();
-      await api.saveSetting('github_app_client_id', nextClientId);
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: keys.settings });
-      setClientIdDraft(null);
-      setMessage('GitHub App Client ID saved.');
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-  const beginLogin = useMutation({
-    mutationFn: api.githubAppBeginDeviceFlow,
-    onSuccess: async (prompt) => {
-      setDevicePrompt(prompt);
-      setMessage('Enter the code on GitHub to finish signing in.');
-      try {
-        await openUrl('https://github.com/login/device');
-      } catch (cause) {
-        setMessage(`Open https://github.com/login/device manually. ${errorMessage(cause)}`);
-      }
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-  const logout = useMutation({
-    mutationFn: api.githubAppLogout,
-    onSuccess: async () => {
-      setDevicePrompt(null);
-      await queryClient.invalidateQueries({ queryKey: ['github-app-account'] });
-      setMessage('GitHub disconnected.');
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-  const saveSource = useMutation({
-    mutationFn: () =>
-      api.saveGitHubProjectSource({
-        projectId,
-        organization: organization.trim(),
-        projectNumber: numericProjectNumber,
-        statusFieldId: effectiveStatusFieldId,
-        pendingOptionId: effectivePendingOptionId,
-        executionScopeId,
-      }),
-    onSuccess: async (source) => {
-      setEditingConfig(false);
-      setMessage(
-        `Watching ${source.organization} · ${source.projectTitle} · ${source.pendingOptionName}.`,
-      );
-      await queryClient.invalidateQueries({ queryKey: ['github-project-sources'] });
-      onChanged();
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-  const sync = useMutation({
-    mutationFn: () => syncAndTriageGitHubProject(projectId),
-    onSuccess: async ({ result, triaged, triageFailures }) => {
-      setMessage(
-        `Synced ${result.seen} matching issues: ${result.imported} new. Triaged ${triaged}${triageFailures ? `; ${triageFailures} triage failed` : ''}.`,
-      );
-      await queryClient.invalidateQueries({ queryKey: keys.tasks });
-      await queryClient.invalidateQueries({ queryKey: ['github-project-sources'] });
-      onChanged();
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-  const disconnect = useMutation({
-    mutationFn: () => api.deleteGitHubProjectSource(projectId),
-    onSuccess: async () => {
-      setEditingConfig(false);
-      setOrganization('');
-      setProjectNumber('');
-      await queryClient.invalidateQueries({ queryKey: ['github-project-sources'] });
-      setMessage('GitHub Project disconnected. Imported tasks remain in Orbyt.');
-    },
-    onError: (cause) => setMessage(errorMessage(cause)),
-  });
-
-  return (
-    <>
-      <h3>GitHub App and Project</h3>
-      <p className="field-hint">
-        Create a GitHub App with Device Flow enabled, install it in the organization, and grant read
-        access to Issues and Projects.
-      </p>
-      <label className="field-label">
-        GitHub App Client ID
-        <div className="form-grid">
-          <input
-            value={clientIdInput}
-            onChange={(event) => setClientIdDraft(event.target.value)}
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <button
-            className="button button-secondary"
-            onClick={() => saveClientId.mutate()}
-            disabled={!clientIdInput.trim() || saveClientId.isPending}
-          >
-            {saveClientId.isPending ? (
-              <LoaderCircle className="spin" size={15} />
-            ) : (
-              <Check size={15} />
-            )}
-            Save Client ID
-          </button>
-        </div>
-        <span className="field-hint">
-          The Client ID is public. Access tokens stay in the operating system credential store.
-        </span>
-      </label>
-      {accountQuery.isLoading ? (
-        <LoadingState label="Checking GitHub login" />
-      ) : accountQuery.data ? (
-        <div className="source-connection-row">
-          <div>
-            <strong>Connected as {accountQuery.data.login}</strong>
-            <span>GitHub App user session</span>
-          </div>
-          <button
-            className="button button-secondary button-small"
-            onClick={() => logout.mutate()}
-            disabled={logout.isPending}
-          >
-            Disconnect GitHub
-          </button>
-        </div>
-      ) : (
-        <button
-          className="button button-secondary"
-          onClick={() => beginLogin.mutate()}
-          disabled={!clientId || beginLogin.isPending}
-        >
-          {beginLogin.isPending ? (
-            <LoaderCircle className="spin" size={15} />
-          ) : (
-            <GitBranch size={15} />
-          )}
-          Sign in with GitHub
-        </button>
-      )}
-      {devicePrompt && (
-        <div className="settings-note">
-          <strong>Enter this code at github.com/login/device</strong>
-          <p className="device-code">{devicePrompt.userCode}</p>
-          <span className="field-hint">
-            Waiting for authorization · expires in {Math.ceil(devicePrompt.expiresIn / 60)} minutes.
-          </span>
-          <button
-            className="button button-secondary button-small"
-            onClick={() => setDevicePrompt(null)}
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-      {accountQuery.error && <ErrorBanner message={errorMessage(accountQuery.error)} />}
-      {configuredSource && !editingConfig && (
-        <div className="source-connection-row">
-          <div>
-            <strong>
-              {configuredSource.organization} · {configuredSource.projectTitle}
-            </strong>
-            <span>
-              {configuredSource.statusFieldName}: {configuredSource.pendingOptionName} · scope{' '}
-              {scopes.find((scope) => scope.id === configuredSource.executionScopeId)
-                ?.relativeDirectory ?? 'unavailable'}
-              {configuredSource.lastSyncedAt
-                ? ` · last sync ${new Date(configuredSource.lastSyncedAt).toLocaleString()}`
-                : ' · waiting for first sync'}
-            </span>
-          </div>
-          <div className="source-connection-actions">
-            <button
-              className="button button-secondary button-small"
-              onClick={() => sync.mutate()}
-              disabled={!accountQuery.data || sync.isPending}
-            >
-              {sync.isPending ? (
-                <LoaderCircle className="spin" size={14} />
-              ) : (
-                <RefreshCw size={14} />
-              )}
-              Sync now
-            </button>
-            <button
-              className="button button-secondary button-small"
-              onClick={() => {
-                setOrganization(configuredSource.organization);
-                setProjectNumber(String(configuredSource.projectNumber));
-                setStatusFieldId(configuredSource.statusFieldId);
-                setPendingOptionId(configuredSource.pendingOptionId);
-                setExecutionScopeId(configuredSource.executionScopeId ?? '');
-                setEditingConfig(true);
-              }}
-            >
-              Edit Project setup
-            </button>
-            <button
-              className="icon-button subtle"
-              onClick={() => disconnect.mutate()}
-              disabled={disconnect.isPending}
-              aria-label="Disconnect GitHub Project"
-            >
-              <Trash2 size={14} />
-            </button>
-          </div>
-        </div>
-      )}
-      {accountQuery.data && (!configuredSource || editingConfig) && (
-        <>
-          <div className="form-grid">
-            <label className="field-label">
-              Organization login
-              <input
-                value={organization}
-                onChange={(event) => {
-                  setOrganization(event.target.value);
-                  setProjectNumber('');
-                }}
-                placeholder="organization"
-              />
-            </label>
-            <label className="field-label">
-              Project
-              <select
-                value={projectNumber}
-                onChange={(event) => {
-                  setProjectNumber(event.target.value);
-                  setStatusFieldId('');
-                  setPendingOptionId('');
-                }}
-                disabled={!organization.trim() || projectsQuery.isLoading}
-              >
-                <option value="">
-                  {projectsQuery.isLoading ? 'Loading Projects…' : 'Choose a Project'}
-                </option>
-                {(Array.isArray(projectsQuery.data) ? projectsQuery.data : []).map((project) => (
-                  <option key={project.id} value={project.number}>
-                    {project.title} · #{project.number}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          {projectsQuery.error && <ErrorBanner message={errorMessage(projectsQuery.error)} />}
-          {numericProjectNumber > 0 && (
-            <div className="form-grid">
-              <label className="field-label">
-                Status field
-                <select
-                  value={effectiveStatusFieldId}
-                  onChange={(event) => {
-                    setStatusFieldId(event.target.value);
-                    setPendingOptionId('');
-                  }}
-                  disabled={fieldsQuery.isLoading}
-                >
-                  <option value="">
-                    {fieldsQuery.isLoading ? 'Loading fields…' : 'Choose a single-select field'}
-                  </option>
-                  {singleSelectFields.map((field) => (
-                    <option key={field.id} value={field.id}>
-                      {field.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field-label">
-                Status to import
-                <select
-                  value={effectivePendingOptionId}
-                  onChange={(event) => setPendingOptionId(event.target.value)}
-                  disabled={!selectedField}
-                >
-                  <option value="">Choose status</option>
-                  {selectedField?.options.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          )}
-          {fieldsQuery.error && <ErrorBanner message={errorMessage(fieldsQuery.error)} />}
-          <label className="field-label">
-            Writable execution scope for automatic runs
-            <select
-              value={executionScopeId}
-              onChange={(event) => setExecutionScopeId(event.target.value)}
-            >
-              <option value="">Choose a scope</option>
-              {scopes
-                .filter((scope) => scope.writeAccess)
-                .map((scope) => (
-                  <option key={scope.id} value={scope.id}>
-                    {scope.name} · {scope.relativeDirectory || '.'}
-                  </option>
-                ))}
-            </select>
-            {scopes.filter((scope) => scope.writeAccess).length === 0 && (
-              <span className="field-hint">
-                Create a writable scope before connecting GitHub. Orbyt requires one for automatic
-                execution.
-              </span>
-            )}
-          </label>
-          {scopes.filter((scope) => scope.writeAccess).length === 0 && localProject && (
-            <button
-              className="button button-secondary button-small"
-              type="button"
-              onClick={() => setShowScopeForm(true)}
-            >
-              <Plus size={14} /> Create writable scope
-            </button>
-          )}
-          <span className="field-hint">
-            Only Issues assigned to your GitHub account, in this Project, with this Status are
-            synchronized. New Issues are triaged automatically; sufficient context starts ACP in the
-            selected scope. Context requests wait for your review.
-          </span>
-          <div className="source-connection-actions">
-            <button
-              className="button button-secondary"
-              onClick={() => saveSource.mutate()}
-              disabled={
-                !projectId ||
-                !accountQuery.data ||
-                !organization.trim() ||
-                numericProjectNumber <= 0 ||
-                !effectiveStatusFieldId ||
-                !effectivePendingOptionId ||
-                !selectedScope ||
-                saveSource.isPending
-              }
-            >
-              {saveSource.isPending ? (
-                <LoaderCircle className="spin" size={15} />
-              ) : (
-                <Check size={15} />
-              )}
-              {configuredSource ? 'Update Project' : 'Connect Project'}
-            </button>
-            {configuredSource && (
-              <button
-                className="button button-secondary"
-                onClick={() => sync.mutate()}
-                disabled={sync.isPending}
-              >
-                {sync.isPending ? (
-                  <LoaderCircle className="spin" size={15} />
-                ) : (
-                  <RefreshCw size={15} />
-                )}
-                Sync now
-              </button>
-            )}
-            {configuredSource && (
-              <button
-                className="button button-secondary"
-                onClick={() => disconnect.mutate()}
-                disabled={disconnect.isPending}
-              >
-                <Trash2 size={15} />
-                Disconnect Project
-              </button>
-            )}
-          </div>
-          {configuredSource?.lastSyncedAt && (
-            <p className="field-hint">
-              Last successful sync: {new Date(configuredSource.lastSyncedAt).toLocaleString()}
-            </p>
-          )}
-        </>
-      )}
-      {message && (
-        <p className="field-hint" role="status">
-          {message}
-        </p>
-      )}
-      {showScopeForm && localProject && (
-        <ScopeForm
-          project={localProject}
-          onClose={() => setShowScopeForm(false)}
-          onCreated={(scope) => {
-            if (scope.writeAccess) {
-              setExecutionScopeId(scope.id);
-              setMessage(`Writable scope “${scope.name}” selected.`);
-            } else {
-              setMessage(
-                'The new scope is read-only. Add a writable scope to connect this Project.',
-              );
-            }
-          }}
-        />
-      )}
-    </>
-  );
 }
 
 function TaskTable({ tasks, projects }: { tasks: Task[]; projects: Project[] }) {

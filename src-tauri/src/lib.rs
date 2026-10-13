@@ -11,7 +11,10 @@ use integrations::{
         GitHubProject, GitHubProjectField,
     },
     glpi_ticket::{self, GlpiTicketContext},
-    opencode::{CliOpenCodeConnector, OpenCodeConnector, OpenCodeStatus, ProjectSession},
+    opencode::{
+        CliOpenCodeConnector, OpenCodeConnector, OpenCodeStatus, ProjectSession, MAX_SESSIONS,
+    },
+    project_resources::{self, ProjectWorkflowResources},
     sources::{
         self, ExternalTask, GitHubConnectInput, GlpiConnectInput, SourceConnection,
         SourceSyncResult, StoredSecrets,
@@ -24,6 +27,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tauri::{Manager, State};
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, Serialize)]
@@ -100,6 +104,7 @@ impl Database {
                 7,
                 include_str!("../migrations/007_github_project_execution_scope.sql"),
             ),
+            (8, include_str!("../migrations/008_glpi_triage_opt_in.sql")),
         ] {
             let applied: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
@@ -406,6 +411,132 @@ struct TaskInput {
     title: String,
     description: String,
     priority: String,
+    #[serde(default)]
+    external_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskExternalLink {
+    source: String,
+    reference: Option<String>,
+    url: Option<String>,
+    glpi_ticket_id: Option<String>,
+}
+
+fn validate_glpi_ticket_url(input: &str, endpoint: &Url) -> Result<(String, String), AppError> {
+    let url = Url::parse(input.trim()).map_err(|_| {
+        AppError::Validation("external URL must be a supported GLPI ticket URL".into())
+    })?;
+    let mut web_root = endpoint.clone();
+    let path = web_root
+        .path()
+        .trim_end_matches('/')
+        .trim_end_matches("apirest.php")
+        .trim_end_matches("api")
+        .to_owned();
+    let root_path = if path.ends_with('/') {
+        path
+    } else {
+        "/".into()
+    };
+    web_root.set_path(&root_path);
+    if url.scheme() != web_root.scheme()
+        || url.host_str() != web_root.host_str()
+        || url.port_or_known_default() != web_root.port_or_known_default()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.path() != format!("{}front/ticket.form.php", web_root.path())
+    {
+        return Err(AppError::Validation(
+            "external URL must be a ticket in this project's configured GLPI instance".into(),
+        ));
+    }
+    let mut ticket_ids = url
+        .query_pairs()
+        .filter(|(key, _)| key == "id")
+        .map(|(_, value)| value.into_owned());
+    let ticket_id = ticket_ids.next().ok_or_else(|| {
+        AppError::Validation("GLPI ticket URL must contain a numeric ticket id".into())
+    })?;
+    if ticket_ids.next().is_some()
+        || url.query_pairs().count() != 1
+        || ticket_id.is_empty()
+        || ticket_id.len() > 20
+        || !ticket_id.bytes().all(|byte| byte.is_ascii_digit())
+        || ticket_id.bytes().all(|byte| byte == b'0')
+    {
+        return Err(AppError::Validation(
+            "GLPI ticket URL must contain only a positive numeric ticket id".into(),
+        ));
+    }
+    let mut canonical_url = web_root;
+    let ticket_path = format!("{}front/ticket.form.php", canonical_url.path());
+    canonical_url.set_path(&ticket_path);
+    canonical_url
+        .query_pairs_mut()
+        .append_pair("id", &ticket_id);
+    Ok((canonical_url.to_string(), ticket_id))
+}
+
+fn glpi_ticket_id_from_reference(reference: &str) -> Option<String> {
+    let ticket_id = reference.rsplit_once("/Ticket/")?.1;
+    (!ticket_id.is_empty()
+        && ticket_id.len() <= 20
+        && ticket_id.bytes().all(|byte| byte.is_ascii_digit())
+        && ticket_id.bytes().any(|byte| byte != b'0'))
+    .then(|| ticket_id.to_owned())
+}
+
+async fn validate_task_external_link(
+    db: &Database,
+    project_id: &str,
+    input: Option<&str>,
+) -> Result<TaskExternalLink, AppError> {
+    let Some(input) = input.map(str::trim).filter(|url| !url.is_empty()) else {
+        return Ok(TaskExternalLink {
+            source: "manual".into(),
+            reference: None,
+            url: None,
+            glpi_ticket_id: None,
+        });
+    };
+    if input.len() > 2048 || input.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "external URL is invalid or too long".into(),
+        ));
+    }
+    if input.contains("github.com") {
+        return Err(AppError::Validation(
+            "manual external links support configured GLPI tickets only".into(),
+        ));
+    }
+    let connection = glpi_connection_for_project(db, project_id).map_err(|_| {
+        AppError::Validation(
+            "configure a GLPI connection for this project before linking a GLPI ticket".into(),
+        )
+    })?;
+    let endpoint = sources::normalize_glpi_endpoint(&connection.api_endpoint)?;
+    let (url, ticket_id) = validate_glpi_ticket_url(input, &endpoint)?;
+    let mut web_root = endpoint;
+    let path = web_root
+        .path()
+        .trim_end_matches('/')
+        .trim_end_matches("apirest.php")
+        .trim_end_matches("api")
+        .to_owned();
+    let root_path = if path.ends_with('/') {
+        path
+    } else {
+        "/".into()
+    };
+    web_root.set_path(&root_path);
+    Ok(TaskExternalLink {
+        source: "glpi".into(),
+        reference: Some(format!("{}Ticket/{ticket_id}", web_root)),
+        url: Some(url),
+        glpi_ticket_id: Some(ticket_id),
+    })
 }
 
 fn validate_task_text(title: &str, description: &str) -> Result<(), AppError> {
@@ -671,11 +802,13 @@ fn list_tasks(project_id: Option<String>, db: State<'_, Database>) -> Result<Vec
 }
 
 #[tauri::command]
-fn create_task(input: TaskInput, db: State<'_, Database>) -> Result<Task, AppError> {
+async fn create_task(input: TaskInput, db: State<'_, Database>) -> Result<Task, AppError> {
     validate_task_text(&input.title, &input.description)?;
     if !["low", "medium", "high", "urgent"].contains(&input.priority.as_str()) {
         return Err(AppError::Validation("invalid task priority".into()));
     }
+    let external_link =
+        validate_task_external_link(&db, &input.project_id, input.external_url.as_deref()).await?;
     let conn = db.connection()?;
     let valid: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
@@ -699,12 +832,12 @@ fn create_task(input: TaskInput, db: State<'_, Database>) -> Result<Task, AppErr
     }
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    conn.execute("INSERT INTO tasks(id,project_id,scope_id,title,description,priority,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)", params![id,input.project_id,input.scope_id,input.title.trim(),input.description.trim(),input.priority,now])?;
+    conn.execute("INSERT INTO tasks(id,project_id,scope_id,title,description,source,external_reference,external_url,linked_glpi_ticket_id,priority,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)", params![id,input.project_id,input.scope_id,input.title.trim(),input.description.trim(),external_link.source,external_link.reference,external_link.url,external_link.glpi_ticket_id,input.priority,now])?;
     conn.query_row("SELECT id,project_id,scope_id,title,description,source,external_reference,external_url,external_status,external_updated_at,linked_glpi_ticket_id,priority,status,created_at,updated_at FROM tasks WHERE id=?1", [id], map_task).map_err(Into::into)
 }
 
 #[tauri::command]
-fn update_task(
+async fn update_task(
     task_id: String,
     input: TaskInput,
     db: State<'_, Database>,
@@ -713,9 +846,11 @@ fn update_task(
     if !["low", "medium", "high", "urgent"].contains(&input.priority.as_str()) {
         return Err(AppError::Validation("invalid task priority".into()));
     }
+    let external_link =
+        validate_task_external_link(&db, &input.project_id, input.external_url.as_deref()).await?;
     let mut conn = db.connection()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let updated = update_task_in_transaction(&tx, &task_id, &input)?;
+    let updated = update_task_in_transaction(&tx, &task_id, &input, &external_link)?;
     tx.commit()?;
     Ok(updated)
 }
@@ -724,6 +859,7 @@ fn update_task_in_transaction(
     tx: &Transaction<'_>,
     task_id: &str,
     input: &TaskInput,
+    external_link: &TaskExternalLink,
 ) -> Result<Task, AppError> {
     let current_status: Option<String> = tx
         .query_row("SELECT status FROM tasks WHERE id=?1", [&task_id], |row| {
@@ -766,7 +902,7 @@ fn update_task_in_transaction(
             ));
         }
     }
-    tx.execute("UPDATE tasks SET project_id=?1,scope_id=?2,title=?3,description=?4,priority=?5,revision=revision+1,updated_at=?6 WHERE id=?7", params![input.project_id,input.scope_id,input.title.trim(),input.description.trim(),input.priority,Utc::now().to_rfc3339(),task_id])?;
+    tx.execute("UPDATE tasks SET project_id=?1,scope_id=?2,title=?3,description=?4,source=?5,external_reference=?6,external_url=?7,linked_glpi_ticket_id=?8,priority=?9,revision=revision+1,updated_at=?10 WHERE id=?11", params![input.project_id,input.scope_id,input.title.trim(),input.description.trim(),external_link.source,external_link.reference,external_link.url,external_link.glpi_ticket_id,input.priority,Utc::now().to_rfc3339(),task_id])?;
     tx.query_row("SELECT id,project_id,scope_id,title,description,source,external_reference,external_url,external_status,external_updated_at,linked_glpi_ticket_id,priority,status,created_at,updated_at FROM tasks WHERE id=?1", [task_id], map_task).map_err(Into::into)
 }
 
@@ -863,6 +999,10 @@ fn transition_in_transaction(
 
 #[tauri::command]
 async fn triage_task(task_id: String, db: State<'_, Database>) -> Result<TaskTriage, AppError> {
+    triage_task_for_app(&task_id, &db).await
+}
+
+async fn triage_task_for_app(task_id: &str, db: &Database) -> Result<TaskTriage, AppError> {
     let (task, revision, executable, endpoint) = {
         let conn = db.connection()?;
         let task = conn
@@ -1007,23 +1147,10 @@ async fn triage_task(task_id: String, db: State<'_, Database>) -> Result<TaskTri
         "INSERT INTO triage_reports(task_id,task_revision,result_json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(task_id) DO UPDATE SET task_revision=excluded.task_revision,result_json=excluded.result_json,created_at=excluded.created_at",
         params![task_id, revision, serde_json::to_string(&result).map_err(|error| AppError::Storage(error.to_string()))?, Utc::now().to_rfc3339()],
     )?;
-    let auto_execute = if next_status.as_str() == TaskStatus::AwaitingApproval.as_str()
-        && task.source == "github"
-        && task.scope_id.is_some()
-    {
-        tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM github_project_sources WHERE project_id=?1 AND execution_scope_id=?2)",
-            params![task.project_id, task.scope_id],
-            |row| row.get::<_, bool>(0),
-        )?
-    } else {
-        false
-    };
     tx.commit()?;
     drop(conn);
-    if auto_execute {
-        execution::queue_task_execution_for_app(&task_id, false, &db)?;
-    }
+    // A triage report never authorizes implementation. ACP always requires a
+    // separate explicit approval, regardless of task source or opt-in setting.
     let updated_task = db.connection()?.query_row(
         "SELECT id,project_id,scope_id,title,description,source,external_reference,external_url,external_status,external_updated_at,linked_glpi_ticket_id,priority,status,created_at,updated_at FROM tasks WHERE id=?1",
         [&task_id],
@@ -1211,6 +1338,7 @@ fn save_setting(key: String, value: String, db: State<'_, Database>) -> Result<(
         "appearance",
         "approval_policy",
         "github_app_client_id",
+        "glpi_auto_triage",
     ]
     .contains(&key.as_str())
     {
@@ -1223,6 +1351,11 @@ fn save_setting(key: String, value: String, db: State<'_, Database>) -> Result<(
     }
     if key == "opencode_last_connected" && !["true", "false"].contains(&value.as_str()) {
         return Err(AppError::Validation("invalid OpenCode status".into()));
+    }
+    if key == "glpi_auto_triage" && !["true", "false"].contains(&value.as_str()) {
+        return Err(AppError::Validation(
+            "GLPI automatic triage opt-in must be true or false".into(),
+        ));
     }
     if key == "opencode_endpoint" && !value.is_empty() {
         let parsed = url::Url::parse(&value)
@@ -1362,10 +1495,15 @@ fn list_github_project_sources(
 }
 
 #[tauri::command]
+#[allow(unreachable_code, unused_variables)]
 async fn save_github_project_source(
     input: GitHubProjectSourceInput,
     db: State<'_, Database>,
 ) -> Result<GitHubProjectSource, AppError> {
+    return Err(AppError::Integration(
+        "GitHub Project intake has been retired; existing configuration and tasks are preserved"
+            .into(),
+    ));
     ensure_project_exists(&db, &input.project_id)?;
     if input.project_number == 0 || input.organization.trim().is_empty() {
         return Err(AppError::Validation(
@@ -1469,10 +1607,14 @@ fn prepare_github_project_triage(
 }
 
 #[tauri::command]
+#[allow(unreachable_code, unused_variables)]
 async fn sync_github_project_source(
     project_id: String,
     db: State<'_, Database>,
 ) -> Result<GitHubProjectSyncResult, AppError> {
+    return Err(AppError::Integration(
+        "GitHub Project sync has been retired; existing tasks and runs are preserved".into(),
+    ));
     let source = {
         let conn = db.connection()?;
         conn.query_row(
@@ -1775,15 +1917,13 @@ async fn sync_source_connection(
         .optional()?
         .ok_or_else(|| AppError::NotFound("source connection".into()))?
     };
+    if connection.provider == "github" {
+        return Err(AppError::Integration(
+            "GitHub Project and Issue sync has been retired; existing records are preserved".into(),
+        ));
+    }
     let secrets = sources::load_secrets(&connection.id)?;
     let (tasks, truncated) = match connection.provider.as_str() {
-        "github" => {
-            let token = secrets.github_token.as_deref().unwrap_or_default();
-            let (owner, repository) = connection.source_key.split_once('/').ok_or_else(|| {
-                AppError::Integration("invalid GitHub repository reference".into())
-            })?;
-            sources::fetch_github_issues(owner, repository, token).await?
-        }
         "glpi" => {
             let endpoint = sources::normalize_glpi_endpoint(&connection.api_endpoint)?;
             sources::fetch_glpi_tickets(&endpoint, &secrets).await?
@@ -1791,13 +1931,11 @@ async fn sync_source_connection(
         _ => return Err(AppError::Integration("unsupported source provider".into())),
     };
     let synced_at = Utc::now().to_rfc3339();
-    let limit = if connection.provider == "github" {
-        500
-    } else {
-        200
-    };
-    let (imported, refreshed, unchanged) =
-        persist_external_tasks(&db, &connection, &tasks, &synced_at)?;
+    // GLPI 10's current search request is deliberately bounded to the first
+    // 100 rows. `truncated` is surfaced to callers whenever more are available.
+    let limit = 100;
+    let (imported, refreshed, unchanged, triage_task_ids) =
+        persist_external_tasks_with_ids(&db, &connection, &tasks, &synced_at)?;
     Ok(SourceSyncResult {
         connection_id,
         provider: connection.provider,
@@ -1805,6 +1943,7 @@ async fn sync_source_connection(
         imported,
         refreshed,
         unchanged,
+        triage_task_ids,
         truncated,
         limit,
         synced_at,
@@ -1852,9 +1991,13 @@ fn persist_external_tasks_with_ids(
     let mut unchanged = 0;
     let mut imported_task_ids = Vec::new();
     for task in tasks {
-        let linked_glpi_ticket_id = glpi_endpoint.as_ref().and_then(|endpoint| {
-            integrations::glpi_ticket::extract_ticket_id_from_issue(&task.description, endpoint)
-        });
+        let linked_glpi_ticket_id = if connection.provider == "glpi" {
+            glpi_ticket_id_from_reference(&task.external_reference)
+        } else {
+            glpi_endpoint.as_ref().and_then(|endpoint| {
+                integrations::glpi_ticket::extract_ticket_id_from_issue(&task.description, endpoint)
+            })
+        };
         let existing: Option<(String, Option<String>, Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT id,external_status,external_updated_at,linked_glpi_ticket_id FROM tasks WHERE project_id=?1 AND source=?2 AND external_reference=?3",
@@ -1979,9 +2122,41 @@ async fn list_opencode_sessions(db: State<'_, Database>) -> Result<Vec<ProjectSe
         );
     }
 
+    sort_dedup_and_limit_sessions(&mut sessions);
+    Ok(sessions)
+}
+
+fn sort_dedup_and_limit_sessions(sessions: &mut Vec<ProjectSession>) {
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.dedup_by(|left, right| left.id == right.id);
-    Ok(sessions)
+    sessions.truncate(MAX_SESSIONS);
+}
+
+#[tauri::command]
+fn list_project_workflow_resources(
+    project_id: String,
+    db: State<'_, Database>,
+) -> Result<ProjectWorkflowResources, AppError> {
+    let stored_directory: String = db
+        .connection()?
+        .query_row(
+            "SELECT directory FROM projects WHERE id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("project".into()))?;
+    let root = std::fs::canonicalize(&stored_directory).map_err(|error| {
+        AppError::Validation(format!(
+            "registered project directory is unavailable: {error}"
+        ))
+    })?;
+    if !root.is_dir() || root.to_str() != Some(stored_directory.as_str()) {
+        return Err(AppError::Validation(
+            "registered project directory is no longer its canonical directory".into(),
+        ));
+    }
+    Ok(project_resources::discover(&root))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2045,6 +2220,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             sync_source_connection,
             verify_opencode,
             list_opencode_sessions,
+            list_project_workflow_resources,
             execution::queue_task_execution,
             execution::list_task_runs,
             execution::respond_to_run_permission,
@@ -2058,6 +2234,173 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_external_link_urls_are_strictly_parsed() {
+        let endpoint = sources::normalize_glpi_endpoint("https://support.example/glpi/apirest.php")
+            .expect("GLPI endpoint");
+        assert_eq!(
+            validate_glpi_ticket_url(
+                "https://support.example/glpi/front/ticket.form.php?id=42",
+                &endpoint,
+            )
+            .expect("valid ticket URL"),
+            (
+                "https://support.example/glpi/front/ticket.form.php?id=42".into(),
+                "42".into()
+            )
+        );
+        for invalid in [
+            "https://other.example/glpi/front/ticket.form.php?id=42",
+            "https://support.example/front/ticket.form.php?id=42",
+            "https://support.example/glpi/front/ticket.form.php?id=42&redirect=evil",
+            "https://support.example/glpi/front/ticket.form.php?id=../42",
+        ] {
+            assert!(
+                validate_glpi_ticket_url(invalid, &endpoint).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            glpi_ticket_id_from_reference("https://support.example/glpi/Ticket/42"),
+            Some("42".into())
+        );
+        for invalid in [
+            "https://support.example/glpi/Ticket/0",
+            "https://support.example/glpi/Ticket/../42",
+            "https://support.example/glpi/Ticket/42/extra",
+        ] {
+            assert_eq!(glpi_ticket_id_from_reference(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn imported_glpi_task_persists_its_own_ticket_id_and_returns_task_id() {
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let db = database_with_task(temp.path(), "pending");
+        let connection = SourceConnection {
+            id: "glpi-source".into(),
+            provider: "glpi".into(),
+            project_id: "project-1".into(),
+            source_key: "https://support.example/glpi/apirest.php".into(),
+            display_name: "GLPI".into(),
+            api_endpoint: "https://support.example/glpi/apirest.php".into(),
+            last_synced_at: None,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        db.connection()
+            .expect("database lock")
+            .execute(
+                "INSERT INTO source_connections(id,provider,project_id,source_key,display_name,api_endpoint,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+                params![connection.id, connection.provider, connection.project_id, connection.source_key, connection.display_name, connection.api_endpoint, "now"],
+            )
+            .expect("GLPI source persists");
+        let ticket = ExternalTask {
+            external_reference: "https://support.example/glpi/Ticket/42".into(),
+            external_url: "https://support.example/glpi/front/ticket.form.php?id=42".into(),
+            title: "Imported ticket".into(),
+            description: "Ticket body".into(),
+            external_status: "2".into(),
+            external_updated_at: None,
+            import_when_missing: true,
+        };
+
+        let (imported, _, _, ids) =
+            persist_external_tasks_with_ids(&db, &connection, &[ticket], "sync-now")
+                .expect("ticket imports");
+        assert_eq!(imported, 1);
+        assert_eq!(ids.len(), 1);
+        let (source, ticket_id, status): (String, String, String) = db
+            .connection()
+            .expect("database lock")
+            .query_row(
+                "SELECT source,linked_glpi_ticket_id,status FROM tasks WHERE id=?1",
+                [&ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("imported GLPI task is linked");
+        assert_eq!(source, "glpi");
+        assert_eq!(ticket_id, "42");
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn task_link_metadata_persists_together_with_task_edit() {
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let db = database_with_task(temp.path(), "awaiting_approval");
+        let conn = db.connection().expect("database lock");
+        let tx = conn
+            .unchecked_transaction()
+            .expect("task update transaction");
+        let input = TaskInput {
+            project_id: "project-1".into(),
+            scope_id: None,
+            title: "Updated title".into(),
+            description: "Updated body".into(),
+            priority: "medium".into(),
+            external_url: Some("https://support.example/glpi/front/ticket.form.php?id=42".into()),
+        };
+        let link = TaskExternalLink {
+            source: "glpi".into(),
+            reference: Some("https://support.example/glpi/Ticket/42".into()),
+            url: input.external_url.clone(),
+            glpi_ticket_id: Some("42".into()),
+        };
+        update_task_in_transaction(&tx, "task-1", &input, &link).expect("task and link update");
+        tx.commit().expect("commit update");
+        let (title, description, source, reference, url, ticket_id): (String, String, String, String, String, String) = conn
+            .query_row("SELECT title,description,source,external_reference,external_url,linked_glpi_ticket_id FROM tasks WHERE id='task-1'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))
+            .expect("linked task is persisted");
+        assert_eq!(title, "Updated title");
+        assert_eq!(description, "Updated body");
+        assert_eq!(source, "glpi");
+        assert_eq!(reference, "https://support.example/glpi/Ticket/42");
+        assert_eq!(
+            url,
+            "https://support.example/glpi/front/ticket.form.php?id=42"
+        );
+        assert_eq!(ticket_id, "42");
+    }
+
+    #[test]
+    fn session_aggregation_returns_fifteen_newest_unique_sessions_total() {
+        let mut sessions = (0..20)
+            .map(|index| ProjectSession {
+                id: format!("session-{index}"),
+                project_id: "project-1".into(),
+                project_name: "Project".into(),
+                project_directory: "/tmp/project".into(),
+                title: String::new(),
+                created_at: index,
+                updated_at: index,
+                parent_id: None,
+            })
+            .collect::<Vec<_>>();
+        sessions.push(ProjectSession {
+            id: "session-19".into(),
+            project_id: "project-2".into(),
+            project_name: "Other project".into(),
+            project_directory: "/tmp/other".into(),
+            title: String::new(),
+            created_at: 19,
+            updated_at: 19,
+            parent_id: None,
+        });
+
+        sort_dedup_and_limit_sessions(&mut sessions);
+
+        assert_eq!(sessions.len(), 15);
+        assert_eq!(sessions[0].updated_at, 19);
+        assert_eq!(sessions.last().map(|session| session.updated_at), Some(5));
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.id == "session-19")
+                .count(),
+            1
+        );
+    }
 
     fn database_with_task(path: &Path, task_status: &str) -> Database {
         let db = Database::open(&path.join("orbyt.sqlite3")).expect("database opens");
@@ -2120,7 +2463,15 @@ mod tests {
                     row.get(0)
                 })
                 .expect("all migrations should be recorded");
-            assert_eq!(migration_count, 7);
+            assert_eq!(migration_count, 8);
+            let auto_triage_default: String = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key='glpi_auto_triage'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("GLPI auto-triage setting has a persisted default");
+            assert_eq!(auto_triage_default, "false");
             let has_revision: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='revision')",
@@ -2349,8 +2700,19 @@ mod tests {
             title: "Changed".into(),
             description: "Changed description".into(),
             priority: "high".into(),
+            external_url: None,
         };
-        let result = update_task_in_transaction(&tx, "task-1", &input);
+        let result = update_task_in_transaction(
+            &tx,
+            "task-1",
+            &input,
+            &TaskExternalLink {
+                source: "manual".into(),
+                reference: None,
+                url: None,
+                glpi_ticket_id: None,
+            },
+        );
         assert!(matches!(result, Err(AppError::Validation(_))));
         drop(tx);
 
@@ -2439,8 +2801,20 @@ mod tests {
             title: "Revised before approval".into(),
             description: "Updated".into(),
             priority: "medium".into(),
+            external_url: None,
         };
-        update_task_in_transaction(&tx, "task-1", &input).expect("task changes inside transaction");
+        update_task_in_transaction(
+            &tx,
+            "task-1",
+            &input,
+            &TaskExternalLink {
+                source: "manual".into(),
+                reference: None,
+                url: None,
+                glpi_ticket_id: None,
+            },
+        )
+        .expect("task changes inside transaction");
 
         let mut scheduler_connection = Connection::open(&database_path).expect("second connection");
         scheduler_connection

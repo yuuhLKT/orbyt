@@ -22,6 +22,14 @@ pub enum SourceError {
     MissingCredentials,
     #[error("the remote service rejected the request (HTTP {0})")]
     RemoteStatus(u16),
+    #[error("GLPI rejected authentication (HTTP 401); check the GLPI user token and, if configured, the App-Token")]
+    GlpiAuthenticationRejected,
+    #[error("GLPI denied this request (HTTP 403); check the account's API permissions and the configured App-Token")]
+    GlpiPermissionDenied,
+    #[error("the GLPI API endpoint was not found (HTTP 404); check the configured host, API path, and that the GLPI REST API is enabled")]
+    GlpiEndpointNotFound,
+    #[error("GLPI returned HTTP {0}; check the configured GLPI API endpoint, credentials, and account permissions")]
+    GlpiRemoteStatus(u16),
     #[error("the remote service returned an invalid response")]
     InvalidResponse,
     #[error("the remote service could not be reached")]
@@ -70,6 +78,7 @@ pub struct SourceSyncResult {
     pub imported: usize,
     pub refreshed: usize,
     pub unchanged: usize,
+    pub triage_task_ids: Vec<String>,
     pub truncated: bool,
     pub limit: usize,
     pub synced_at: String,
@@ -423,7 +432,7 @@ async fn open_glpi_session(endpoint: &Url, secrets: &StoredSecrets) -> Result<St
         .send()
         .await
         .map_err(|_| SourceError::RequestFailed)?;
-    let body = read_json(response).await?;
+    let body = read_glpi_json(response).await?;
     body.get("session_token")
         .and_then(Value::as_str)
         .filter(|token| !token.trim().is_empty())
@@ -454,7 +463,7 @@ async fn close_glpi_session(
         .send()
         .await
         .map_err(|_| SourceError::RequestFailed)?;
-    ensure_success(response.status())
+    ensure_glpi_success(response.status())
 }
 
 async fn fetch_glpi_tickets_with_session(
@@ -480,7 +489,7 @@ async fn fetch_glpi_tickets_with_session(
         .send()
         .await
         .map_err(|_| SourceError::RequestFailed)?;
-    let options = read_json(options_response).await?;
+    let options = read_glpi_json(options_response).await?;
     let id_field = find_search_field(&options, "id").ok_or(SourceError::InvalidResponse)?;
     let name_field = find_search_field(&options, "name").ok_or(SourceError::InvalidResponse)?;
     let content_field =
@@ -499,18 +508,6 @@ async fn fetch_glpi_tickets_with_session(
         false,
     )
     .await?;
-    let (closed_rows, closed_truncated) = search_glpi_tickets(
-        endpoint,
-        secrets,
-        session,
-        &id_field,
-        &name_field,
-        &content_field,
-        &status_field,
-        date_field.as_deref(),
-        true,
-    )
-    .await?;
     let web_root = glpi_web_root(endpoint);
     let open_tasks = open_rows
         .into_iter()
@@ -527,25 +524,7 @@ async fn fetch_glpi_tickets_with_session(
             )
         })
         .collect::<Vec<_>>();
-    let closed_tasks = closed_rows
-        .into_iter()
-        .filter_map(|row| {
-            parse_glpi_ticket(
-                &row,
-                &id_field,
-                &name_field,
-                &content_field,
-                &status_field,
-                date_field.as_deref(),
-                &web_root,
-                false,
-            )
-        })
-        .collect::<Vec<_>>();
-    Ok((
-        open_tasks.into_iter().chain(closed_tasks).collect(),
-        open_truncated || closed_truncated,
-    ))
+    Ok((open_tasks, open_truncated))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,7 +577,7 @@ async fn search_glpi_tickets(
         .send()
         .await
         .map_err(|_| SourceError::RequestFailed)?;
-    let body = read_json(response).await?;
+    let body = read_glpi_json(response).await?;
     let total = body.get("totalcount").and_then(Value::as_u64).unwrap_or(0) as usize;
     let rows = body
         .get("data")
@@ -695,6 +674,15 @@ fn glpi_web_root(endpoint: &Url) -> Url {
 
 async fn read_json(response: Response) -> Result<Value, SourceError> {
     ensure_success(response.status())?;
+    read_json_body(response).await
+}
+
+async fn read_glpi_json(response: Response) -> Result<Value, SourceError> {
+    ensure_glpi_success(response.status())?;
+    read_json_body(response).await
+}
+
+async fn read_json_body(response: Response) -> Result<Value, SourceError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -724,6 +712,18 @@ fn ensure_success(status: StatusCode) -> Result<(), SourceError> {
     }
 }
 
+fn ensure_glpi_success(status: StatusCode) -> Result<(), SourceError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(match status.as_u16() {
+        401 => SourceError::GlpiAuthenticationRejected,
+        403 => SourceError::GlpiPermissionDenied,
+        404 => SourceError::GlpiEndpointNotFound,
+        status => SourceError::GlpiRemoteStatus(status),
+    })
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
@@ -738,6 +738,23 @@ mod tests {
         thread::{self, JoinHandle},
         time::Instant,
     };
+
+    #[test]
+    fn glpi_http_errors_offer_safe_setup_and_permission_guidance() {
+        for (status, expected) in [
+            (401, "check the GLPI user token"),
+            (403, "check the account's API permissions"),
+            (404, "check the configured host, API path"),
+            (503, "check the configured GLPI API endpoint"),
+        ] {
+            let status = StatusCode::from_u16(status).expect("test status is valid");
+            let error = ensure_glpi_success(status).expect_err("non-success status is rejected");
+            let message = error.to_string();
+            assert!(message.contains(expected));
+            assert!(!message.contains("response body"));
+            assert!(!message.contains("token-value"));
+        }
+    }
 
     #[derive(Debug)]
     struct MockRequest {
@@ -1019,16 +1036,11 @@ mod tests {
             "totalcount":1,
             "data":[{"2":"27","1":"Open ticket","21":"Open body","12":"2","19":"2026-10-10 10:00:00"}]
         });
-        let closed_results = serde_json::json!({
-            "totalcount":1,
-            "data":[{"2":"28","1":"Resolved ticket","21":"Resolved body","12":"Solved","19":"2026-10-10 11:00:00"}]
-        });
         let (endpoint, server) = start_mock_http_server(
             vec![
                 mock_response(200, serde_json::json!({"session_token":"mock-session"})),
                 mock_response(200, options),
                 mock_response(200, open_results),
-                mock_response(200, closed_results),
                 mock_response(200, serde_json::json!({"message":"Session terminated"})),
             ],
             "/glpi/apirest.php/",
@@ -1045,12 +1057,10 @@ mod tests {
         let requests = server.join().expect("mock server finishes");
 
         assert!(!truncated);
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.len(), 1);
         assert!(tasks[0].external_reference.ends_with("/glpi/Ticket/27"));
-        assert!(tasks[1].external_reference.ends_with("/glpi/Ticket/28"));
         assert!(tasks[0].import_when_missing);
-        assert!(!tasks[1].import_when_missing);
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].target, "/glpi/apirest.php/initSession/");
         assert_eq!(
             requests[0].headers.get("authorization").map(String::as_str),
@@ -1075,10 +1085,10 @@ mod tests {
             "/glpi/apirest.php/listSearchOptions/Ticket"
         );
         assert_eq!(
-            requests[3].target.split('?').next(),
+            requests[2].target.split('?').next(),
             Some("/glpi/apirest.php/search/Ticket/")
         );
-        assert_eq!(requests[4].target, "/glpi/apirest.php/killSession/");
+        assert_eq!(requests[3].target, "/glpi/apirest.php/killSession/");
 
         let open_query = mock_query(&requests[2]);
         assert_eq!(
@@ -1100,18 +1110,41 @@ mod tests {
             open_query.get("forcedisplay[4]").map(String::as_str),
             Some("19")
         );
+    }
 
-        let closed_query = mock_query(&requests[3]);
-        assert_eq!(
-            closed_query
-                .get("criteria[0][searchtype]")
-                .map(String::as_str),
-            Some("equals")
+    #[tokio::test]
+    async fn glpi_sync_reports_truncation_when_unresolved_result_exceeds_bounded_page() {
+        let (endpoint, server) = start_mock_http_server(
+            vec![mock_response(
+                200,
+                serde_json::json!({"totalcount":101,"data": []}),
+            )],
+            "/glpi/apirest.php/",
         );
-        assert_eq!(
-            closed_query.get("criteria[1][link]").map(String::as_str),
-            Some("OR")
-        );
+        let secrets = StoredSecrets {
+            github_token: None,
+            glpi_user_token: None,
+            glpi_app_token: None,
+        };
+        let (rows, truncated) = search_glpi_tickets(
+            &endpoint,
+            &secrets,
+            "mock-session",
+            "2",
+            "1",
+            "21",
+            "12",
+            Some("19"),
+            false,
+        )
+        .await
+        .expect("bounded GLPI search succeeds");
+        let requests = server.join().expect("mock server finishes");
+        assert!(rows.is_empty());
+        assert!(truncated);
+        let query = mock_query(&requests[0]);
+        assert_eq!(query.get("range").map(String::as_str), Some("0-99"));
+        assert_eq!(query.get("order").map(String::as_str), Some("DESC"));
     }
 
     #[tokio::test]
@@ -1140,7 +1173,7 @@ mod tests {
         let result = fetch_glpi_tickets(&endpoint, &secrets).await;
         let requests = server.join().expect("mock server finishes");
 
-        assert!(matches!(result, Err(SourceError::RemoteStatus(403))));
+        assert!(matches!(result, Err(SourceError::GlpiPermissionDenied)));
         assert_eq!(requests.len(), 4);
         assert_eq!(
             requests.last().map(|request| request.target.as_str()),
@@ -1167,7 +1200,7 @@ mod tests {
         let result = fetch_glpi_tickets(&endpoint, &secrets).await;
         let requests = server.join().expect("mock server finishes");
 
-        assert!(matches!(result, Err(SourceError::RemoteStatus(302))));
+        assert!(matches!(result, Err(SourceError::GlpiRemoteStatus(302))));
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].target, "/glpi/apirest.php/initSession/");
     }
