@@ -9,7 +9,6 @@ use url::Url;
 const GITHUB_API: &str = "https://api.github.com/";
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SYNC_ITEMS: usize = 500;
 const PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Error)]
@@ -241,118 +240,6 @@ async fn verify_github_issue_access_at(
     } else {
         Err(SourceError::InvalidResponse)
     }
-}
-
-pub async fn fetch_github_issues(
-    owner: &str,
-    repository: &str,
-    token: &str,
-) -> Result<(Vec<ExternalTask>, bool), SourceError> {
-    let api_base = Url::parse(GITHUB_API).map_err(|_| SourceError::InvalidConfiguration)?;
-    fetch_github_issues_at(&api_base, owner, repository, token).await
-}
-
-async fn fetch_github_issues_at(
-    api_base: &Url,
-    owner: &str,
-    repository: &str,
-    token: &str,
-) -> Result<(Vec<ExternalTask>, bool), SourceError> {
-    let (owner, repository) = validate_github_input(owner, repository, token)?;
-    let client = client()?;
-    let mut tasks = Vec::new();
-    let mut truncated = false;
-    for page in 1..=MAX_SYNC_ITEMS.div_ceil(PAGE_SIZE) {
-        let url = api_base
-            .join(&format!("repos/{owner}/{repository}/issues"))
-            .map_err(|_| SourceError::InvalidConfiguration)?;
-        let mut request = client
-            .get(url)
-            .query(&[
-                ("state", "all"),
-                ("per_page", "100"),
-                ("sort", "updated"),
-                ("direction", "desc"),
-            ])
-            .query(&[("page", page.to_string())])
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token.trim());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| SourceError::RequestFailed)?;
-        let body = read_json(response).await?;
-        let issues = body.as_array().ok_or(SourceError::InvalidResponse)?;
-        if issues.is_empty() {
-            break;
-        }
-        for issue in issues {
-            if issue.get("pull_request").is_some() {
-                continue;
-            }
-            if let Some(task) = parse_github_issue(issue, &owner, &repository) {
-                tasks.push(task);
-            }
-        }
-        if issues.len() < PAGE_SIZE {
-            break;
-        }
-        if page == MAX_SYNC_ITEMS.div_ceil(PAGE_SIZE) {
-            truncated = true;
-        }
-    }
-    Ok((tasks, truncated))
-}
-
-fn parse_github_issue(issue: &Value, owner: &str, repository: &str) -> Option<ExternalTask> {
-    let number = issue.get("number")?.as_u64()?;
-    let title = bounded_text(issue.get("title")?.as_str()?, 200);
-    let body = issue
-        .get("body")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let labels = issue
-        .get("labels")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|label| label.get("name").and_then(Value::as_str))
-        .take(20)
-        .collect::<Vec<_>>();
-    let description = if labels.is_empty() {
-        bounded_text(body, 10_000)
-    } else {
-        bounded_text(&format!("Labels: {}\n\n{body}", labels.join(", ")), 10_000)
-    };
-    let external_status = issue
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("open")
-        .to_owned();
-    let external_updated_at = issue
-        .get("updated_at")
-        .and_then(Value::as_str)
-        .map(|value| bounded_text(value, 80));
-    Some(ExternalTask {
-        external_reference: format!("{owner}/{repository}#{number}"),
-        external_url: issue
-            .get("html_url")
-            .and_then(Value::as_str)
-            .filter(|url| url.starts_with("https://github.com/"))
-            .unwrap_or("https://github.com")
-            .to_owned(),
-        title,
-        description,
-        external_status,
-        external_updated_at,
-        import_when_missing: issue
-            .get("state")
-            .and_then(Value::as_str)
-            .is_some_and(|state| state == "open"),
-    })
 }
 
 pub fn store_secrets(connection_id: &str, secrets: &StoredSecrets) -> Result<(), SourceError> {
@@ -873,68 +760,12 @@ mod tests {
         assert!(normalize_glpi_endpoint("http://127.0.0.1/glpi/apirest.php").is_ok());
     }
 
-    #[test]
-    fn github_import_skips_pull_requests_and_bounds_untrusted_text() {
-        let issue = serde_json::json!({
-            "number": 42,
-            "title": "Fix this",
-            "body": "A detailed issue",
-            "state": "open",
-            "updated_at": "2026-10-10T12:00:00Z",
-            "html_url": "https://github.com/acme/orbyt/issues/42",
-            "labels": [{"name":"bug"}]
-        });
-        let task = parse_github_issue(&issue, "acme", "orbyt").expect("issue maps");
-        assert_eq!(task.external_reference, "acme/orbyt#42");
-        assert!(task.description.starts_with("Labels: bug"));
-        assert!(task.external_url.starts_with("https://github.com/"));
-
-        let closed_issue = serde_json::json!({
-            "number": 43,
-            "title": "Closed issue",
-            "state": "closed"
-        });
-        let closed = parse_github_issue(&closed_issue, "acme", "orbyt").expect("closed issue maps");
-        assert!(!closed.import_when_missing);
-
-        let pull_request = serde_json::json!({"number":1,"pull_request":{}});
-        assert!(parse_github_issue(&pull_request, "acme", "orbyt").is_none());
-        assert_eq!(bounded_text(&"x".repeat(250), 200).chars().count(), 200);
-    }
-
     #[tokio::test]
-    async fn github_connection_and_sync_use_read_only_auth_and_paginate_issues() {
-        let mut first_page = (1..=99)
-            .map(|number| {
-                serde_json::json!({
-                    "number": number,
-                    "title": format!("Issue {number}"),
-                    "state": "open",
-                    "updated_at": "2026-10-10T12:00:00Z",
-                    "html_url": format!("https://github.com/Acme/Orbyt/issues/{number}")
-                })
-            })
-            .collect::<Vec<_>>();
-        first_page.push(serde_json::json!({
-            "number": 100,
-            "title": "Pull request",
-            "state": "open",
-            "pull_request": {},
-            "html_url": "https://github.com/Acme/Orbyt/pull/100"
-        }));
-        let second_page = serde_json::json!([{
-            "number": 101,
-            "title": "Previously closed issue",
-            "state": "closed",
-            "updated_at": "2026-10-10T13:00:00Z",
-            "html_url": "https://github.com/Acme/Orbyt/issues/101"
-        }]);
+    async fn github_repository_verification_uses_read_only_auth() {
         let (api_base, server) = start_mock_http_server(
             vec![
                 mock_response(200, serde_json::json!({"full_name":"Acme/Orbyt"})),
                 mock_response(200, serde_json::json!([])),
-                mock_response(200, Value::Array(first_page)),
-                mock_response(200, second_page),
             ],
             "/api/v3/",
         );
@@ -943,21 +774,10 @@ mod tests {
             verify_github_repository_at(&api_base, "acme", "orbyt", "mock-github-token")
                 .await
                 .expect("repository connection succeeds");
-        let (tasks, truncated) =
-            fetch_github_issues_at(&api_base, "Acme", "Orbyt", "mock-github-token")
-                .await
-                .expect("issue sync succeeds");
         let requests = server.join().expect("mock server finishes");
 
         assert_eq!(repository, "Acme/Orbyt");
-        assert!(!truncated);
-        assert_eq!(tasks.len(), 100);
-        assert!(tasks
-            .iter()
-            .all(|task| !task.external_reference.ends_with("#100")));
-        assert!(tasks[0].import_when_missing);
-        assert!(!tasks[99].import_when_missing);
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].target, "/api/v3/repos/acme/orbyt");
         for request in &requests {
             assert_eq!(
@@ -975,12 +795,6 @@ mod tests {
         let access_query = mock_query(&requests[1]);
         assert_eq!(access_query.get("state").map(String::as_str), Some("open"));
         assert_eq!(access_query.get("per_page").map(String::as_str), Some("1"));
-        let first_query = mock_query(&requests[2]);
-        assert_eq!(first_query.get("state").map(String::as_str), Some("all"));
-        assert_eq!(first_query.get("per_page").map(String::as_str), Some("100"));
-        assert_eq!(first_query.get("page").map(String::as_str), Some("1"));
-        let second_query = mock_query(&requests[3]);
-        assert_eq!(second_query.get("page").map(String::as_str), Some("2"));
     }
 
     #[test]
